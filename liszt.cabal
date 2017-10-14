@@ -22,7 +22,7 @@ library
     , stm
     , binary
     , websockets
-    , containers
+    , containers >= 0.5.8
   ghc-options: -Wall
   default-language:    Haskell2010
 

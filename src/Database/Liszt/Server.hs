@@ -18,15 +18,15 @@ import Data.String
 import Database.Liszt.Types
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as BL
-import qualified Data.IntMap.Strict as M
+import qualified Data.Sequence as S
 import qualified Network.WebSockets as WS
 import System.Directory
 import System.IO
 
 data System = System
-    { vPayload :: TVar (M.IntMap (B.ByteString, Int64))
+    { vPayload :: TVar (S.Seq (B.ByteString, Int64))
     -- ^ A collection of payloads which are not available on disk.
-    , vIndices :: TVar (M.IntMap Int64)
+    , vOffsets :: TVar (S.Seq Int64)
     -- ^ Map of byte offsets
     , vAccess :: TVar Bool
     -- ^ Is the payload file in use?
@@ -45,28 +45,28 @@ acquire v m = do
 
 -- | Read the payload at the position in 'TVar', and update it by the next position.
 fetchPayload :: System
-  -> TVar (M.Key, Int64)
-  -> STM (IO (M.Key, B.ByteString))
+  -> TVar (Int, Int64)
+  -> STM (IO (Int, B.ByteString))
 fetchPayload System{..} v = do
   (ofs, pos) <- readTVar v
-  m <- readTVar vIndices
-  case M.lookupGT ofs m of
-    Just op@(_, pos') -> do
-      writeTVar v op
+  m <- readTVar vOffsets
+  case S.lookup ofs m of
+    Just pos' -> do
+      writeTVar v (ofs + 1, pos')
       return $ acquire vAccess $ do
         hSeek theHandle AbsoluteSeek (fromIntegral pos)
         bs <- B.hGet theHandle $ fromIntegral $ pos' - pos
         return (ofs, bs)
-    Nothing -> M.lookupGT ofs <$> readTVar vPayload >>= \case
-      Just (ofs', (bs, pos')) -> do
-        writeTVar v (ofs', pos')
+    Nothing -> S.lookup (ofs - S.length m) <$> readTVar vPayload >>= \case
+      Just (bs, pos') -> do
+        writeTVar v (ofs + 1, pos')
         return $ return (ofs, bs)
       Nothing -> retry
 
 handleConsumer :: System -> WS.Connection -> IO ()
 handleConsumer sys@System{..} conn = do
   -- start from the beginning of the stream
-  vOffset <- newTVarIO (minBound, 0)
+  vOffset <- newTVarIO (0, 0)
 
   let transaction (NonBlocking r) = transaction r
         <|> pure (WS.sendTextData conn ("EOF" :: BL.ByteString))
@@ -75,8 +75,9 @@ handleConsumer sys@System{..} conn = do
       transaction Peek = WS.sendBinaryData conn . encode . fst
           <$> readTVar vOffset
       transaction (Seek ofs) = do
-        m <- readTVar vIndices
-        writeTVar vOffset $ maybe (minBound, 0) id $ M.lookupLT (fromIntegral ofs) m
+        m <- readTVar vOffsets
+        let i = fromIntegral ofs
+        writeTVar vOffset $ maybe (0, 0) ((,) i) $ S.lookup i m
         return $ return ()
 
   forever $ do
@@ -86,58 +87,46 @@ handleConsumer sys@System{..} conn = do
       Left (_, _, e) -> WS.sendClose conn (fromString e :: B.ByteString)
 
 -- | The final offset.
-getLastOffset :: System -> STM (Maybe (M.Key, Int64))
-getLastOffset System{..} = readTVar vPayload >>= \m -> case M.maxViewWithKey m of
-  Just ((k, (_, p)), _) -> return $ Just (k, p)
-  Nothing -> fmap fst <$> M.maxViewWithKey <$> readTVar vIndices
+getLastOffset :: System -> STM Int64
+getLastOffset System{..} = readTVar vPayload >>= \m -> case S.viewr m of
+  _ S.:> (_, p) -> return p
+  S.EmptyR -> readTVar vOffsets >>= \n -> case S.viewr n of
+    _ S.:> p -> return p
+    S.EmptyR -> return 0
 
 data MonotonicityViolation = MonotonicityViolation deriving Show
 instance Exception MonotonicityViolation
 
 -- | Push a payload.
-pushPayload :: System -> M.Key -> B.ByteString -> STM ()
-pushPayload sys@System{..} k content = do
-  p <- getLastOffset sys >>= \case
-    Just (k0, p)
-      | k > k0 -> return p
-      | otherwise -> throwSTM MonotonicityViolation
-    Nothing -> return 0
+pushPayload :: System -> B.ByteString -> STM ()
+pushPayload sys@System{..} content = do
+  p <- getLastOffset sys
 
   let !p' = p + fromIntegral (B.length content)
-  modifyTVar' vPayload (M.insert k (content, p'))
+  modifyTVar' vPayload (S.|> (content, p'))
 
 handleProducer :: System -> WS.Connection -> IO ()
 handleProducer sys@System{..} conn = forever $ do
   reqBS <- WS.receiveData conn
   case runGetOrFail get reqBS of
-    Right (BL.toStrict -> !content, _, req) -> join $ atomically $ do
-      m <- readTVar vPayload
-
-      let push k p = return () <$ pushPayload sys k p
-
-      case req of
-        Write k -> push (fromIntegral k) content
-          `catchSTM` \MonotonicityViolation -> return
-              (WS.sendClose conn ("Monotonicity violation" :: B.ByteString))
-        WriteSeqNo -> getLastOffset sys >>= \case
-          Just (k, _) -> push (k + 1) content
-          Nothing -> push 0 content
+    Right (BL.toStrict -> !content, _, req) -> join $ atomically $ case req of
+      WriteSeqNo -> return () <$ pushPayload sys content
 
     Left _ -> WS.sendClose conn ("Malformed request" :: B.ByteString)
 
-loadIndices :: FilePath -> IO (M.IntMap Int64)
+loadIndices :: FilePath -> IO (S.Seq Int64)
 loadIndices path = doesFileExist path >>= \case
-  False -> return M.empty
+  False -> return S.empty
   True -> do
-    n <- (`div`16) <$> fromIntegral <$> getFileSize path
+    n <- (`div`8) <$> fromIntegral <$> getFileSize path
     bs <- BL.readFile path
-    return $! M.fromAscList $ runGet (replicateM n $ (,) <$> get <*> get) bs
+    return $! S.fromList $ runGet (replicateM n get) bs
 
 synchronise :: FilePath -> System -> IO ()
 synchronise ipath System{..} = forever $ do
   m <- atomically $ do
     w <- readTVar vPayload
-    when (M.null w) retry
+    when (S.null w) retry
     return w
 
   acquire vAccess $ do
@@ -146,11 +135,11 @@ synchronise ipath System{..} = forever $ do
     hFlush theHandle
 
   BL.appendFile ipath
-    $ B.runPut $ forM_ (M.toList m) $ \(k, (_, p)) -> B.put k >> B.put p
+    $ B.runPut $ forM_ m (B.put . snd)
 
   atomically $ do
-    modifyTVar' vIndices $ M.union (fmap snd m)
-    modifyTVar' vPayload $ flip M.difference m
+    modifyTVar' vOffsets (S.>< fmap snd m)
+    modifyTVar' vPayload (S.drop (S.length m))
 
 -- | Start a liszt server. 'openLisztServer "foo"' creates two files:
 --
@@ -163,9 +152,9 @@ openLisztServer path = do
   let ipath = path ++ ".indices"
   let ppath = path ++ ".payload"
 
-  vIndices <- loadIndices ipath >>= newTVarIO
+  vOffsets <- loadIndices ipath >>= newTVarIO
 
-  vPayload <- newTVarIO M.empty
+  vPayload <- newTVarIO S.empty
 
   vAccess <- newTVarIO False
 

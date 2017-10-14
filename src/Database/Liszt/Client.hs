@@ -10,7 +10,6 @@ module Database.Liszt.Client (
   -- * Producer
   , Producer
   , withProducer
-  , write
   , writeSeqNo
   ) where
 
@@ -68,13 +67,6 @@ newtype Producer = Producer Connection
 -- | Acquire a producer.
 withProducer :: String -> Int -> String -> (Producer -> IO a) -> IO a
 withProducer host port name k = runClient host port ("/" ++ name ++ "/write") $ k . Producer
-
--- | Write a payload with the specified offset. If the offset is less than the
--- last offset, it raises 'ConnectionException'.
-write :: MonadIO m => Producer -> Int64 -> B.ByteString -> m ()
-write (Producer conn) ofs bs = liftIO $ sendBinaryData conn $ runPut $ do
-  put $ Write ofs
-  putByteString bs
 
 -- | Write a payload with an increasing natural number as an offset (starts from 0).
 -- Atomic and non-blocking.
