@@ -1,5 +1,5 @@
 {-# LANGUAGE RecordWildCards, LambdaCase, OverloadedStrings, ViewPatterns, BangPatterns #-}
-module Database.Liszt.Server (System
+module Database.Liszt.Server (Server
     , pushPayload
     , MonotonicityViolation
     , openLisztServer) where
@@ -22,7 +22,7 @@ import qualified Network.WebSockets as WS
 import System.Directory
 import System.IO
 
-data System = System
+data Server = Server
     { vPayload :: TVar (S.Seq (B.ByteString, Int64))
     -- ^ A collection of payloads which are not available on disk.
     , vOffsets :: TVar (S.Seq Int64)
@@ -43,10 +43,10 @@ acquire v m = do
   m `finally` atomically (writeTVar v False)
 
 -- | Read the payload at the position in 'TVar', and update it by the next position.
-fetchPayload :: System
+fetchPayload :: Server
   -> TVar (Int, Int64)
   -> STM (IO (Int, B.ByteString))
-fetchPayload System{..} v = do
+fetchPayload Server{..} v = do
   (ofs, pos) <- readTVar v
   m <- readTVar vOffsets
   case S.lookup ofs m of
@@ -62,8 +62,8 @@ fetchPayload System{..} v = do
         return $ return (ofs, bs)
       Nothing -> retry
 
-handleConsumer :: System -> WS.Connection -> IO ()
-handleConsumer sys@System{..} conn = do
+handleConsumer :: Server -> WS.Connection -> IO ()
+handleConsumer sys@Server{..} conn = do
   -- start from the beginning of the stream
   vOffset <- newTVarIO (0, 0)
 
@@ -86,8 +86,8 @@ handleConsumer sys@System{..} conn = do
       Left (_, _, e) -> WS.sendClose conn (fromString e :: B.ByteString)
 
 -- | The final offset.
-getLastOffset :: System -> STM Int64
-getLastOffset System{..} = readTVar vPayload >>= \m -> case S.viewr m of
+getLastOffset :: Server -> STM Int64
+getLastOffset Server{..} = readTVar vPayload >>= \m -> case S.viewr m of
   _ S.:> (_, p) -> return p
   S.EmptyR -> readTVar vOffsets >>= \n -> case S.viewr n of
     _ S.:> p -> return p
@@ -97,15 +97,15 @@ data MonotonicityViolation = MonotonicityViolation deriving Show
 instance Exception MonotonicityViolation
 
 -- | Push a payload.
-pushPayload :: System -> B.ByteString -> STM ()
-pushPayload sys@System{..} content = do
+pushPayload :: Server -> B.ByteString -> STM ()
+pushPayload sys@Server{..} content = do
   p <- getLastOffset sys
 
   let !p' = p + fromIntegral (B.length content)
   modifyTVar' vPayload (S.|> (content, p'))
 
-handleProducer :: System -> WS.Connection -> IO ()
-handleProducer sys@System{..} conn = forever $ do
+handleProducer :: Server -> WS.Connection -> IO ()
+handleProducer sys@Server{..} conn = forever $ do
   reqBS <- WS.receiveData conn
   case runGetOrFail get reqBS of
     Right (BL.toStrict -> !content, _, req) -> join $ atomically $ case req of
@@ -121,8 +121,8 @@ loadIndices path = doesFileExist path >>= \case
     bs <- BL.readFile path
     return $! S.fromList $ runGet (replicateM n get) bs
 
-synchronise :: FilePath -> System -> IO ()
-synchronise ipath System{..} = forever $ do
+synchronise :: FilePath -> Server -> IO ()
+synchronise ipath Server{..} = forever $ do
   m <- atomically $ do
     w <- readTVar vPayload
     when (S.null w) retry
@@ -146,7 +146,7 @@ synchronise ipath System{..} = forever $ do
 --
 -- * @foo.payload@: All payloads concatenated as one file.
 --
-openLisztServer :: FilePath -> IO (System, IO (), WS.ServerApp)
+openLisztServer :: FilePath -> IO (Server, IO (), WS.ServerApp)
 openLisztServer path = do
   let ipath = path ++ ".indices"
   let ppath = path ++ ".payload"
@@ -160,7 +160,7 @@ openLisztServer path = do
   theHandle <- openBinaryFile ppath ReadWriteMode
   hSetBuffering theHandle (BlockBuffering Nothing)
 
-  let sys = System{..}
+  let sys = Server{..}
 
   return (sys
     , forever $ synchronise ipath sys
