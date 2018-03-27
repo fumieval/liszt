@@ -45,9 +45,10 @@ main = getArgs >>= \args -> withOptions args $ \(Options host port dir) _ -> do
     app <- case HM.lookup name m of
       Just app -> app <$ putMVar vServers m
       Nothing -> do
-        (_, _, app) <- openLisztServer
+        (_, start, app) <- openLisztServer
           (maybe "" dropTrailingPathSeparator dir ++ BS.unpack name)
           `onException` putMVar vServers m
+        _ <- forkIO start
         putMVar vServers $! HM.insert name app m
         return app
     app pending { pendingRequest = req { requestPath = action } }

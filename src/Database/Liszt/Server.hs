@@ -5,7 +5,6 @@ module Database.Liszt.Server (System
     , openLisztServer) where
 
 import Control.Applicative
-import Control.Concurrent
 import Control.Concurrent.STM
 import Control.Exception
 import Control.Monad
@@ -147,7 +146,7 @@ synchronise ipath System{..} = forever $ do
 --
 -- * @foo.payload@: All payloads concatenated as one file.
 --
-openLisztServer :: FilePath -> IO (System, ThreadId, WS.ServerApp)
+openLisztServer :: FilePath -> IO (System, IO (), WS.ServerApp)
 openLisztServer path = do
   let ipath = path ++ ".indices"
   let ppath = path ++ ".payload"
@@ -163,10 +162,10 @@ openLisztServer path = do
 
   let sys = System{..}
 
-  tid <- forkIO $ forever $ synchronise ipath sys
-    `catch` \e -> hPutStrLn stderr $ "synchronise: " ++ show (e :: IOException)
-
-  return (sys, tid, \pending -> case WS.requestPath (WS.pendingRequest pending) of
+  return (sys
+    , forever $ synchronise ipath sys
+      `catch` \e -> hPutStrLn stderr $ "synchronise: " ++ show (e :: IOException)
+    , \pending -> case WS.requestPath (WS.pendingRequest pending) of
     "read" -> WS.acceptRequest pending >>= handleConsumer sys
     "write" -> WS.acceptRequest pending >>= handleProducer sys
     p -> WS.rejectRequest pending ("Bad request: " <> p))
