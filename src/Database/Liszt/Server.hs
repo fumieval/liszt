@@ -49,18 +49,18 @@ fetchPayload :: Server
 fetchPayload Server{..} v = do
   (ofs, pos) <- readTVar v
   m <- readTVar vOffsets
-  case S.lookup ofs m of
-    Just pos' -> do
+  case ofs < S.length m of
+    True | pos' <- S.index m ofs -> do
       writeTVar v (ofs + 1, pos')
       return $ acquire vAccess $ do
         hSeek theHandle AbsoluteSeek (fromIntegral pos)
         bs <- B.hGet theHandle $ fromIntegral $ pos' - pos
         return (ofs, bs)
-    Nothing -> S.lookup (ofs - S.length m) <$> readTVar vPayload >>= \case
-      Just (bs, pos') -> do
+    False -> readTVar vPayload >>= \p -> case ofs - S.length m < S.length p of
+      True | (bs, pos') <- S.index p (ofs - S.length m) -> do
         writeTVar v (ofs + 1, pos')
         return $ return (ofs, bs)
-      Nothing -> retry
+      False -> retry
 
 handleConsumer :: Server -> WS.Connection -> IO ()
 handleConsumer sys@Server{..} conn = do
@@ -76,7 +76,7 @@ handleConsumer sys@Server{..} conn = do
       transaction (Seek ofs) = do
         m <- readTVar vOffsets
         let i = fromIntegral ofs
-        writeTVar vOffset $ maybe (0, 0) ((,) i) $ S.lookup i m
+        writeTVar vOffset (i, S.index m i)
         return $ return ()
 
   forever $ do
@@ -117,8 +117,8 @@ loadIndices :: FilePath -> IO (S.Seq Int64)
 loadIndices path = doesFileExist path >>= \case
   False -> return S.empty
   True -> do
-    n <- (`div`8) <$> fromIntegral <$> getFileSize path
     bs <- BL.readFile path
+    let n = fromIntegral $ BL.length bs `div` 8
     return $! S.fromList $ runGet (replicateM n get) bs
 
 synchronise :: FilePath -> Server -> IO ()
