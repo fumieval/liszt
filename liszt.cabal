@@ -25,6 +25,8 @@ library
     , containers
     , transformers
     , semigroups
+    , unordered-containers
+    , filepath
   ghc-options: -Wall
   default-language:    Haskell2010
 

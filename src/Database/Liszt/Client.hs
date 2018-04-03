@@ -5,8 +5,6 @@ module Database.Liszt.Client (
   , withConsumer
   , readBlocking
   , readNonBlocking
-  , seek
-  , peek
   -- * Producer
   , Producer
   , withProducer
@@ -37,29 +35,19 @@ parsePayload bs = liftIO $ case runGetOrFail get bs of
   Left _ -> throwIO $ ParseException "Malformed response"
 
 -- | Fetch a payload.
-readBlocking :: MonadIO m => Consumer -> m (Int64, B.ByteString)
-readBlocking (Consumer conn) = liftIO $ do
-  sendBinaryData conn $ encode Read
+readBlocking :: MonadIO m => Consumer -> StreamId -> Offset -> m (Int64, B.ByteString)
+readBlocking (Consumer conn) name ofs = liftIO $ do
+  sendBinaryData conn $ encode $ Read name ofs True
   receiveData conn >>= parsePayload
 
--- | Fetch a payload. If it is at the end of the stream, return 'Nothing'.
-readNonBlocking :: MonadIO m => Consumer -> m (Maybe (Int64, B.ByteString))
-readNonBlocking (Consumer conn) = liftIO $ do
-  sendBinaryData conn $ encode $ NonBlocking Read
+-- | Fetch a payload.
+readNonBlocking :: MonadIO m => Consumer -> StreamId -> Offset -> m (Maybe (Int64, B.ByteString))
+readNonBlocking (Consumer conn) name ofs = liftIO $ do
+  sendBinaryData conn $ encode $ Read name ofs False
   receiveDataMessage conn >>= \case
-    Text "EOF" -> return Nothing
+    Text "EOF" _ -> return Nothing
     Binary bs -> Just <$> parsePayload bs
     _ -> throwIO $ ParseException "Expecting EOF"
-
--- | Seek to a specicied position.
-seek :: MonadIO m => Consumer -> Int64 -> m ()
-seek (Consumer conn) ofs = liftIO $ sendBinaryData conn $ encode $ Seek ofs
-
--- | Returns the next offset.
-peek :: MonadIO m => Consumer -> m Int64
-peek (Consumer conn) = liftIO $ do
-  sendBinaryData conn $ encode Peek
-  decode <$> receiveData conn
 
 -- | Connection as a producer
 newtype Producer = Producer Connection
@@ -70,7 +58,7 @@ withProducer host port name k = runClient host port ("/" ++ name ++ "/write") $ 
 
 -- | Write a payload with an increasing natural number as an offset (starts from 0).
 -- Atomic and non-blocking.
-writeSeqNo :: MonadIO m => Producer -> B.ByteString -> m ()
-writeSeqNo (Producer conn) bs = liftIO $ sendBinaryData conn $ runPut $ do
-  put WriteSeqNo
+writeSeqNo :: MonadIO m => Producer -> StreamId -> B.ByteString -> m ()
+writeSeqNo (Producer conn) name bs = liftIO $ sendBinaryData conn $ runPut $ do
+  put $ WriteSeqNo name
   putByteString bs
