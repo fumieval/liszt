@@ -13,11 +13,13 @@ import Data.Binary as B
 import Data.Binary.Get as B
 import Data.Binary.Put as B
 import Data.Int
+import Data.List (foldl')
 import Data.Semigroup
 import Data.String
 import Database.Liszt.Types
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as BL
+import qualified Data.HashMap.Strict as HM
 import qualified Data.IntMap.Strict as M
 import qualified Network.WebSockets as WS
 import System.Directory
@@ -28,6 +30,7 @@ data Server = Server
     -- ^ A collection of payloads which are not available on disk.
     , vOffsets :: TVar (M.IntMap Int64)
     -- ^ Map of byte offsets
+    , vIndices :: TVar (HM.HashMap IndexName (M.IntMap M.Key))
     , vAccess :: TVar Bool
     -- ^ Is the payload file in use?
     , theHandle :: Handle
@@ -95,16 +98,16 @@ data MonotonicityViolation = MonotonicityViolation deriving Show
 instance Exception MonotonicityViolation
 
 -- | Push a payload.
-pushPayload :: Server -> M.Key -> B.ByteString -> STM ()
-pushPayload sys@Server{..} k content = do
-  p <- getLastOffset sys >>= \case
-    Just (k0, p)
-      | k > k0 -> return p
-      | otherwise -> throwSTM MonotonicityViolation
-    Nothing -> return 0
+pushPayload :: Server -> [(IndexName, M.Key)] -> B.ByteString -> STM ()
+pushPayload sys@Server{..} ks content = do
+  (o, p) <- getLastOffset sys >>= \case
+    Just (o0, p) -> return (o0 + 1, p)
+    Nothing -> return (0, 0)
 
   let !p' = p + fromIntegral (B.length content)
-  modifyTVar' vPayload (M.insert k (content, p'))
+  modifyTVar' vPayload (M.insert o (content, p'))
+  modifyTVar' vIndices
+    $ \m0 -> foldl' (\m (name, i) -> HM.insertWith M.union name (M.singleton i o) m) m0 ks
 
 handleProducer :: Server -> WS.Connection -> IO ()
 handleProducer sys@Server{..} conn = forever $ do
@@ -114,11 +117,10 @@ handleProducer sys@Server{..} conn = forever $ do
       let push k p = return () <$ pushPayload sys k p
 
       case req of
-        Write k -> push (fromIntegral k) content
+        Write k -> push (fmap fromIntegral <$> k) content
           `catchSTM` \MonotonicityViolation -> return
               (WS.sendClose conn ("Monotonicity violation" :: B.ByteString))
-        WriteSeqNo -> push (k + 1) content
-          Nothing -> push 0 content
+        WriteSeqNo -> push [] content
 
     Left _ -> WS.sendClose conn ("Malformed request" :: B.ByteString)
 
@@ -157,10 +159,11 @@ synchronise ipath Server{..} = forever $ do
 --
 openLisztServer :: FilePath -> IO (Server, ThreadId, WS.ServerApp)
 openLisztServer path = do
-  let ipath = path ++ ".indices"
+  let ipath = path ++ ".offsets"
   let ppath = path ++ ".payload"
 
   vOffsets <- loadIndices ipath >>= newTVarIO
+  vIndices <- newTVarIO HM.empty
 
   vPayload <- newTVarIO M.empty
 

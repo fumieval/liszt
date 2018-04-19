@@ -70,7 +70,7 @@ withProducer host port name k = runClient host port ("/" ++ name ++ "/write") $ 
 
 -- | Write a payload with the specified offset. If the offset is less than the
 -- last offset, it raises 'ConnectionException'.
-write :: MonadIO m => Producer -> Int64 -> B.ByteString -> m ()
+write :: MonadIO m => Producer -> [(IndexName, Int64)] -> B.ByteString -> m ()
 write (Producer conn) ofs bs = liftIO $ sendBinaryData conn $ runPut $ do
   put $ Write ofs
   putByteString bs

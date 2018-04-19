@@ -23,6 +23,7 @@ library
     , binary
     , websockets
     , containers
+    , unordered-containers
   ghc-options: -Wall
   default-language:    Haskell2010
 

@@ -5,6 +5,7 @@ import Data.Binary
 import Data.Binary.Get
 import Data.Binary.Put
 import Data.Int
+import qualified Data.ByteString.Short as BS
 
 data ConsumerRequest = Read
   | Peek
@@ -23,7 +24,7 @@ instance Binary ConsumerRequest where
   put (Seek b) = putWord8 83 >> put b
   put (NonBlocking r) = putWord8 78 >> put r
 
-data ProducerRequest = Write !Int64
+data ProducerRequest = Write ![(IndexName, Int64)]
   | WriteSeqNo
   deriving Show
 
@@ -34,3 +35,5 @@ instance Binary ProducerRequest where
     _ -> fail "Unknown tag"
   put (Write ofs) = putWord8 87 >> put ofs
   put WriteSeqNo = putWord8 83
+
+type IndexName = BS.ShortByteString
