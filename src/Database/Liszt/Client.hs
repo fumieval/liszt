@@ -48,9 +48,8 @@ readNonBlocking :: MonadIO m => Consumer -> m (Maybe (Int64, B.ByteString))
 readNonBlocking (Consumer conn) = liftIO $ do
   sendBinaryData conn $ encode $ NonBlocking Read
   receiveDataMessage conn >>= \case
-    Text "EOF" -> return Nothing
     Binary bs -> Just <$> parsePayload bs
-    _ -> throwIO $ ParseException "Expecting EOF"
+    _ -> return Nothing
 
 -- | Seek to a specicied position.
 seek :: MonadIO m => Consumer -> Int64 -> m ()
