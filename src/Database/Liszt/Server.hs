@@ -26,7 +26,7 @@ import System.IO
 data Server = Server
     { vPayload :: TVar (M.IntMap (B.ByteString, Int64))
     -- ^ A collection of payloads which are not available on disk.
-    , vIndices :: TVar (M.IntMap Int64)
+    , vOffsets :: TVar (M.IntMap Int64)
     -- ^ Map of byte offsets
     , vAccess :: TVar Bool
     -- ^ Is the payload file in use?
@@ -49,7 +49,7 @@ fetchPayload :: Server
   -> STM (IO (M.Key, B.ByteString))
 fetchPayload Server{..} v = do
   (ofs, pos) <- readTVar v
-  m <- readTVar vIndices
+  m <- readTVar vOffsets
   case M.lookupGT ofs m of
     Just op@(_, pos') -> do
       writeTVar v op
@@ -75,7 +75,7 @@ handleConsumer sys@Server{..} conn = do
       transaction Peek = WS.sendBinaryData conn . encode . fst
           <$> readTVar vOffset
       transaction (Seek ofs) = do
-        m <- readTVar vIndices
+        m <- readTVar vOffsets
         writeTVar vOffset $ maybe (minBound, 0) id $ M.lookupLT (fromIntegral ofs) m
         return $ return ()
 
@@ -89,7 +89,7 @@ handleConsumer sys@Server{..} conn = do
 getLastOffset :: Server -> STM (Maybe (M.Key, Int64))
 getLastOffset Server{..} = readTVar vPayload >>= \m -> case M.maxViewWithKey m of
   Just ((k, (_, p)), _) -> return $ Just (k, p)
-  Nothing -> fmap fst <$> M.maxViewWithKey <$> readTVar vIndices
+  Nothing -> fmap fst <$> M.maxViewWithKey <$> readTVar vOffsets
 
 data MonotonicityViolation = MonotonicityViolation deriving Show
 instance Exception MonotonicityViolation
@@ -117,8 +117,7 @@ handleProducer sys@Server{..} conn = forever $ do
         Write k -> push (fromIntegral k) content
           `catchSTM` \MonotonicityViolation -> return
               (WS.sendClose conn ("Monotonicity violation" :: B.ByteString))
-        WriteSeqNo -> getLastOffset sys >>= \case
-          Just (k, _) -> push (k + 1) content
+        WriteSeqNo -> push (k + 1) content
           Nothing -> push 0 content
 
     Left _ -> WS.sendClose conn ("Malformed request" :: B.ByteString)
@@ -147,7 +146,7 @@ synchronise ipath Server{..} = forever $ do
     $ B.runPut $ forM_ (M.toList m) $ \(k, (_, p)) -> B.put k >> B.put p
 
   atomically $ do
-    modifyTVar' vIndices $ M.union (fmap snd m)
+    modifyTVar' vOffsets $ M.union (fmap snd m)
     modifyTVar' vPayload $ flip M.difference m
 
 -- | Start a liszt server. 'openLisztServer "foo"' creates two files:
@@ -161,7 +160,7 @@ openLisztServer path = do
   let ipath = path ++ ".indices"
   let ppath = path ++ ".payload"
 
-  vIndices <- loadIndices ipath >>= newTVarIO
+  vOffsets <- loadIndices ipath >>= newTVarIO
 
   vPayload <- newTVarIO M.empty
 
