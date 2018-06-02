@@ -72,11 +72,11 @@ openWriter path = do
     then withFile payloadPath ReadMode hFileSize >>= newMVar . fromIntegral
     else newMVar 0
   writeFile indexPath $ unlines $ toList (idents :: f String)
-  hPayload <- openFile payloadPath AppendMode
-  hOffset <- openFile offsetPath AppendMode
+  hPayload <- openBinaryFile payloadPath AppendMode
+  hOffset <- openBinaryFile offsetPath AppendMode
   liftIO $ hSetBuffering hOffset NoBuffering
   hIndices <- forM idents $ \s -> do
-    h <- openFile (indexPath <.> s) AppendMode
+    h <- openBinaryFile (indexPath <.> s) AppendMode
     hSetBuffering h NoBuffering
     return h
   return WriterHandle{..}
@@ -141,9 +141,10 @@ data Stream = Stream
 
 createStream :: WatchManager -> FilePath -> IO Stream
 createStream man path = do
+  exist <- doesDirectoryExist path
+  unless exist $ throwIO StreamNotFound
   let offsetPath = path </> "offsets"
   let payloadPath = path </> "payloads"
-  createDirectoryIfMissing False path
   initialOffsetsBS <- B.readFile offsetPath
   payloadHandle <- openBinaryFile payloadPath ReadMode
   let getInts bs = runGet (replicateM (B.length bs `div` 8) get)
