@@ -22,6 +22,7 @@ data Options = Options
   , index :: Maybe B.ByteString
   , ranges :: [(Int, Int)]
   , beginning :: Maybe Int
+  , prefixSize :: Bool
   }
 
 readOffset :: String -> Int
@@ -37,6 +38,7 @@ options = [Option "h" ["host"] (ReqArg (\str o -> o { host = str }) "HOST:PORT")
   , Option "b" ["begin"] (ReqArg (\str o -> o { beginning = Just $! readOffset str }) "pos") "get all the contents from this position"
   , Option "t" ["timeout"] (ReqArg (\str o -> o { timeout = read str }) "SECONDS") "Timeout"
   , Option "i" ["index"] (ReqArg (\str o -> o { index = Just $ B.pack str }) "NAME") "Index name"
+  , Option "s" ["size-prefix"] (NoArg (\o -> o { prefixSize = True })) "Prefix payloads by their sizes, in decimals"
   ]
 
 defaultOptions :: Options
@@ -46,11 +48,12 @@ defaultOptions = Options
   , ranges = []
   , beginning = Nothing
   , index = Nothing
+  , prefixSize = False
   }
 
-printBS :: (a, b, B.ByteString) -> IO ()
-printBS (_, _, bs) = do
-  print $ B.length bs
+printBS :: Options -> (a, b, B.ByteString) -> IO ()
+printBS o (_, _, bs) = do
+  when (prefixSize o) $ print $ B.length bs
   B.hPutStr stdout bs
   hFlush stdout
 
@@ -64,10 +67,10 @@ main = getOpt Permute options <$> getArgs >>= \case
       let req = Request name' (index o) (index o) timeout' AllItems
       forM_ (reverse $ ranges o) $ \(i, j) -> do
         bss <- fetch conn $ req i j
-        mapM_ printBS bss
+        mapM_ (printBS o) bss
       forM_ (beginning o) $ \start -> flip fix start $ \self i -> do
         bss <- fetch conn $ req i i
-        mapM_ printBS bss
+        mapM_ (printBS o) bss
         unless (null bss) $ self $ let (j, _, _) = last bss in j + 1
 
   (_, _, es) -> do
