@@ -260,7 +260,7 @@ handleRequest LisztReader{..} (Request name bindex_ eindex_ timeout rt begin_ en
     allOffsets <- readTVar vOffsets
     indexSnapshots <- traverse readTVar reverseIndices
     let finalOffset = case IM.maxViewWithKey allOffsets of
-          Just ((k, _), _) -> k + 1
+          Just ((k, _), _) -> k + 2
           Nothing -> 0
     let rotate i
           | i < 0 = finalOffset + i
