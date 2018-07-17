@@ -23,6 +23,7 @@ data Options = Options
   , ranges :: [(Int, Int)]
   , beginning :: Maybe Int
   , prefixSize :: Bool
+  , delimiter :: String
   }
 
 readOffset :: String -> Int
@@ -39,6 +40,7 @@ options = [Option "h" ["host"] (ReqArg (\str o -> o { host = str }) "HOST:PORT")
   , Option "t" ["timeout"] (ReqArg (\str o -> o { timeout = read str }) "SECONDS") "Timeout"
   , Option "i" ["index"] (ReqArg (\str o -> o { index = Just $ B.pack str }) "NAME") "Index name"
   , Option "s" ["size-prefix"] (NoArg (\o -> o { prefixSize = True })) "Prefix payloads by their sizes, in decimals"
+  , Option "d" ["delimiter"] (ReqArg (\str o -> o { delimiter = read $ "\"" ++ str ++ "\"" }) "STRING") "Payload delimiter"
   ]
 
 defaultOptions :: Options
@@ -49,12 +51,14 @@ defaultOptions = Options
   , beginning = Nothing
   , index = Nothing
   , prefixSize = False
+  , delimiter = ""
   }
 
 printBS :: Options -> (a, b, B.ByteString) -> IO ()
 printBS o (_, _, bs) = do
   when (prefixSize o) $ print $ B.length bs
   B.hPutStr stdout bs
+  putStr (delimiter o)
   hFlush stdout
 
 main :: IO ()
