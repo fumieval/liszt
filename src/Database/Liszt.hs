@@ -7,6 +7,7 @@ module Database.Liszt (
     closeWriter,
     withWriter,
     write,
+    writeBy,
     -- * Reader
     Request(..),
     RequestType(..),
@@ -91,16 +92,19 @@ withWriter :: Naming f => FilePath -> (WriterHandle f -> IO ()) -> IO ()
 withWriter path = bracket (openWriter path) closeWriter
 
 write :: Naming f => WriterHandle f -> f Int64 -> B.ByteString -> IO ()
-write WriterHandle{..} ixs bs = mask $ \restore -> do
+write wh ixs bs = writeBy wh ixs (\h -> B.length bs <$ B.hPutStr h bs)
+
+writeBy :: Naming f => WriterHandle f -> f Int64 -> (Handle -> IO Int) -> IO ()
+writeBy WriterHandle{..} ixs putter = mask $ \restore -> do
   ofs <- takeMVar vOffset
-  let ofs' = ofs + B.length bs
   restore (do
-    B.hPutStr hPayload bs
+    len <- putter hPayload
+    let ofs' = ofs + len
     sequence_ $ liftA2 (\h -> B.hPutStr h . BL.toStrict . encode) hIndices ixs
     B.hPutStr hOffset $! BL.toStrict $ encode ofs'
     hFlush hPayload
+    putMVar vOffset ofs'
     ) `onException` putMVar vOffset ofs
-  putMVar vOffset ofs'
 
 data RequestType = AllItems | LastItem deriving (Show, Generic)
 instance Binary RequestType
