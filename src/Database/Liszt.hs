@@ -1,8 +1,10 @@
 {-# LANGUAGE DeriveGeneric, RecordWildCards, LambdaCase, Rank2Types, ScopedTypeVariables #-}
 module Database.Liszt (
     -- * Writer interface
+    Transaction,
     insert,
     commit,
+    commitFile,
     -- * Reader
     Request(..),
     RequestType(..),
@@ -23,7 +25,7 @@ import Control.Exception
 import Control.Monad
 import Control.Monad.IO.Class
 import Database.Liszt.Internal
-import Data.Winery
+import Data.Binary
 import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Lazy as BL
 import Data.Foldable (toList)
@@ -40,22 +42,28 @@ import System.FilePath
 import System.IO
 import System.FSNotify
 
-{-
+commitFile :: FilePath -> Transaction () -> IO ()
+commitFile path m = withBinaryFile path ReadWriteMode $ \h -> commit h m
+
 data RequestType = AllItems | LastItem deriving (Show, Generic)
-instance Serialise RequestType
+instance Binary RequestType
 
 data Request = Request
   { streamName :: !B.ByteString
+  , reqFromIndex :: !(Maybe B.ByteString)
+  , reqToIndex :: !(Maybe B.ByteString)
   , reqTimeout :: !Int
   , reqType :: !RequestType
   , reqFrom :: !Int
   , reqTo :: !Int
   } deriving (Show, Generic)
-instance Serialise Request
+instance Binary Request
 
 defRequest :: B.ByteString -> Request
 defRequest name = Request
   { streamName = name
+  , reqFromIndex = Nothing
+  , reqToIndex = Nothing
   , reqTimeout = maxBound `div` 2
   , reqFrom = 0
   , reqTo = 0
@@ -65,13 +73,13 @@ defRequest name = Request
 type IndexMap = HM.HashMap B.ByteString
 
 data Stream = Stream
-  { vRoot :: TMVar Frame
+  { vRoot :: TMVar (Frame RawPointer)
   , followThread :: ThreadId
   , streamHandle :: Handle
   }
 
 createStream :: WatchManager -> FilePath -> IO Stream
-createStream man path = do
+createStream man path = undefined {-do
   exist <- doesFileExist path
   unless exist $ throwIO StreamNotFound
   payloadHandle <- openBinaryFile path ReadMode
@@ -91,7 +99,7 @@ createStream man path = do
           atomically $ putTMVar vRoot a
           atomically $ isEmptyTMVar vRoot >>= \b -> unless b retry
 
-  return Stream{..}
+  return Stream{..} -}
 
 data LisztError = MalformedRequest
   | StreamNotFound
@@ -110,15 +118,10 @@ withLisztReader prefix k = do
   vStreams <- newTVarIO HM.empty
   withManager $ \watchManager -> k LisztReader{..}
 
-handleRequest :: Stream
+handleRequest :: LisztReader
   -> Request
-  -> IO (Handle, [(Int, Int, Int)])
-handleRequest Stream{..} (Request name timeout rt begin_ end_) = do
-  root <- atomically $ readTMVar vRoot
+  -> IO (Handle, [(Int, IndexMap Int, Int, Int)])
+handleRequest _ _ = undefined
 
-  let len = sum $ map fst spine
-  let wanted = end_ - begin_ + 1
--}
-
-fetchLocal :: LisztReader -> Request -> IO [(Int, B.ByteString)]
+fetchLocal :: LisztReader -> Request -> IO [(Int, IndexMap Int, B.ByteString)]
 fetchLocal env req = undefined

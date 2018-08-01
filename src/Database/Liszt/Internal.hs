@@ -1,16 +1,23 @@
 {-# LANGUAGE LambdaCase, DeriveFunctor, DeriveGeneric #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 module Database.Liszt.Internal (
   Key
+  , Tag
   , TransactionState
   , Transaction
+  , Frame
+  , RawPointer
+  , footerSize
+  , decodeFrame
+  -- * Writing
   , insert
   , commit
-  , Frame
-  , Spine
-  , decodeFrame
-  , lookupSpine
+  -- * Reading
+  , queryRange
+  , querySearch
   ) where
 
+import Control.Monad
 import Control.Monad.IO.Class
 import Control.Monad.Trans.State.Strict
 import qualified Data.ByteString as B
@@ -23,49 +30,81 @@ import System.IO
 
 type Key = B.ByteString
 
+-- | Tag is an extra value attached to a payload. This can be used to perform
+-- a binary search.
+type Tag = B.ByteString
+
 type Spine a = [(Int, a)]
 
-instance Show Encoding where
-  show e = "<Encoding " ++ show (WB.getSize e) ++ ">"
+newtype KeyPointer = KeyPointer RawPointer deriving Serialise
 
 data Frame a = Empty
-  | Payload !Encoding
-  | Leaf1 !Key !(Spine a)
-  | Leaf2 !Key !(Spine a) !Key !(Spine a)
-  | Node2 !a !Key !(Spine a) !a
-  | Node3 !a !Key !(Spine a) !a !Key !(Spine a) !a
-  | Tree !a !a !a
-  deriving (Generic, Functor, Show)
+  | Leaf1 !KeyPointer !(Spine a)
+  | Leaf2 !KeyPointer !(Spine a) !KeyPointer !(Spine a)
+  | Node2 !a !KeyPointer !(Spine a) !a
+  | Node3 !a !KeyPointer !(Spine a) !a !KeyPointer !(Spine a) !a
+  | Tree !Tag !RawPointer !a !a
+  | Leaf !Tag !RawPointer
+  deriving (Generic, Functor)
 
-insert :: Key -> Encoding -> Transaction ()
-insert key payload = do
-  ofs <- addFrame (Payload payload)
+insert :: Key -> B.ByteString -> Encoding -> Transaction ()
+insert key tag payload = do
+  h <- gets dbHandle
+  liftIO $ hSeek h SeekFromEnd 0
+  ofs <- liftIO $ fromIntegral <$> hTell h
+  liftIO $ WB.hPut h payload
   root <- gets currentRoot
-  insertF key (insertSpine ofs) root >>= \case
+  insertF key (insertSpine tag (ofs, WB.getSize payload)) root >>= \case
     Pure t -> modify $ \ts -> ts { currentRoot = t }
     Carry l k a r -> modify $ \ts -> ts { currentRoot = Node2 l k a r }
 
 type RawPointer = (Int, Int)
 
+footerSize :: Int
+footerSize = 256
+
 fetchRoot :: Handle -> IO (Frame RawPointer)
 fetchRoot h = do
-  hSeek h SeekFromEnd 2048
-  bs <- B.hGetSome h 2048
-  return $! if B.null bs
-    then Empty
-    else decodeFrame bs
+  size <- hFileSize h
+  if size == 0
+    then return Empty
+    else do
+      hSeek h SeekFromEnd (-fromIntegral footerSize)
+      bs <- B.hGetSome h footerSize
+      return $ if B.length bs == 0
+        then Empty
+        else if B.length bs == footerSize
+          then decodeFrame bs
+          else error "fetchRoot: malformed footer"
 
-commit :: Handle -> Transaction () -> IO ()
+allocKey :: Key -> Transaction KeyPointer
+allocKey key = do
+  h <- gets dbHandle
+  ofs <- liftIO $ do
+    hSeek h SeekFromEnd 0
+    ofs <- fromIntegral <$> hTell h
+    B.hPutStr h key
+    return ofs
+  return $ KeyPointer (ofs, B.length key)
+
+fetchKey :: Handle -> KeyPointer -> IO Key
+fetchKey h (KeyPointer (ofs, len)) = do
+  hSeek h AbsoluteSeek (fromIntegral ofs)
+  B.hGet h len
+
+fetchKeyT :: KeyPointer -> Transaction Key
+fetchKeyT p = gets dbHandle >>= \h -> liftIO (fetchKey h p)
+
+commit :: Handle -> Transaction a -> IO a
 commit h transaction = do
   root <- fmap Commited <$> fetchRoot h
-  TS _ _ pendings root' <- execStateT transaction $ TS h 0 Map.empty root
+  (a, TS _ _ pendings root') <- runStateT transaction $ TS h 0 Map.empty root
 
   let substP (Commited ofs) = return ofs
       substP (Uncommited i) = case Map.lookup i pendings of
         Just f -> substF f
         Nothing -> error "panic!"
       substF Empty = return (0, 0)
-      substF (Payload p) = write (Payload p)
       substF (Leaf1 pk pv) = do
         pv' <- traverse (traverse substP) pv
         write (Leaf1 pk pv')
@@ -85,41 +124,54 @@ commit h transaction = do
         qv' <- traverse (traverse substP) qv
         r' <- substP r
         write (Node3 l' pk pv' m' qk qv' r')
-      substF (Tree p l r) = do
-        p' <- substP p
+      substF (Tree t p l r) = do
         l' <- substP l
         r' <- substP r
-        write (Tree p' l' r')
+        write (Tree t p l' r')
+      substF (Leaf t p) = write (Leaf t p)
 
+  hSeek h SeekFromEnd 0
   offset0 <- fromIntegral <$> hTell h
   (_, len) <- evalStateT (substF root') offset0
-  B.hPutStr h $ B.replicate (2048 - len) 0
+  B.hPutStr h $ B.replicate (footerSize - len) 0
   hFlush h
+  return a
   where
     write :: Frame RawPointer -> StateT Int IO RawPointer
     write f = do
       ofs <- get
       let e = toEncoding f
+      liftIO $ hSeek h SeekFromEnd 0
       liftIO $ WB.hPut h e
       put $! ofs + WB.getSize e
       return (ofs, WB.getSize e)
 
 lookupSpine :: Handle -> Key -> Frame RawPointer -> IO (Maybe (Spine RawPointer))
-lookupSpine _ k (Leaf1 p v) | k == p = return (Just v)
-lookupSpine _ k (Leaf2 p u q v)
-  | k == p = return (Just u)
-  | k == q = return (Just v)
-lookupSpine h k (Node2 l p v r) = case compare k p of
-  LT -> fetchRaw h l >>= lookupSpine h k
-  EQ -> return (Just v)
-  GT -> fetchRaw h r >>= lookupSpine h k
-lookupSpine h k (Node3 l p u m q v r) = case compare k p of
-  LT -> fetchRaw h l >>= lookupSpine h k
-  EQ -> return (Just u)
-  GT -> case compare k q of
-    LT -> fetchRaw h m >>= lookupSpine h k
+lookupSpine h k (Leaf1 p v) = do
+  vp <- fetchKey h p
+  if k == vp then return (Just v) else return Nothing
+lookupSpine h k (Leaf2 p u q v) = do
+  vp <- fetchKey h p
+  if k == vp then return (Just u) else do
+    vq <- fetchKey h q
+    return $ if k == vq then Just v else Nothing
+lookupSpine h k (Node2 l p v r) = do
+  vp <- fetchKey h p
+  case compare k vp of
+    LT -> fetchRaw h l >>= lookupSpine h k
     EQ -> return (Just v)
     GT -> fetchRaw h r >>= lookupSpine h k
+lookupSpine h k (Node3 l p u m q v r) = do
+  vp <- fetchKey h p
+  case compare k vp of
+    LT -> fetchRaw h l >>= lookupSpine h k
+    EQ -> return (Just u)
+    GT -> do
+      vq <- fetchKey h q
+      case compare k vq of
+        LT -> fetchRaw h m >>= lookupSpine h k
+        EQ -> return (Just v)
+        GT -> fetchRaw h r >>= lookupSpine h k
 lookupSpine _ _ _ = return Nothing
 
 instance Serialise a => Serialise (Frame a)
@@ -153,155 +205,257 @@ fetch :: Pointer -> Transaction (Frame Pointer)
 fetch (Commited p) = do
   h <- gets dbHandle
   liftIO $ fmap Commited <$> fetchRaw h p
-fetch (Uncommited i) = gets pending >>= return . maybe (error "not found") id . Map.lookup i
+fetch (Uncommited i) = gets pending >>= return . maybe (error "fetch: not found") id . Map.lookup i
 
 data Result a = Pure (Frame a)
-  | Carry !a !Key !(Spine a) !a
+  | Carry !a !KeyPointer !(Spine a) !a
 
-insertSpine :: Pointer -> Spine Pointer -> Transaction (Spine Pointer)
-insertSpine p ((m, x) : (n, y) : ss) | m == n = do
-  t <- addFrame $ Tree p x y
+insertSpine :: B.ByteString -> RawPointer -> Spine Pointer -> Transaction (Spine Pointer)
+insertSpine tag p ((m, x) : (n, y) : ss) | m == n = do
+  t <- addFrame $ Tree tag p x y
   return $ (2 * m + 1, t) : ss
-insertSpine p ss = return $ (1, p) : ss
+insertSpine tag p ss = do
+  t <- addFrame $ Leaf tag p
+  return $ (1, t) : ss
 
 insertF :: Key -> (Spine Pointer -> Transaction (Spine Pointer)) -> Frame Pointer -> Transaction (Result Pointer)
-insertF k u Empty = Pure <$> Leaf1 k <$> u []
-insertF k u (Leaf1 pk pv) = Pure <$> case compare k pk of
-  LT -> (\v -> Leaf2 k v pk pv) <$> u []
-  EQ -> Leaf1 k <$> u pv
-  GT -> Leaf2 pk pv k <$> u []
-insertF k u (Leaf2 pk pv qk qv) = case compare k pk of
-  LT -> do
-    v <- u []
-    l <- addFrame $ Leaf1 k v
-    r <- addFrame $ Leaf1 qk qv
-    return $ Carry l pk pv r
-  EQ -> do
-    v <- u pv
-    return $ Pure $ Leaf2 k v qk qv
-  GT -> case compare k qk of
+insertF k u Empty = Pure <$> (Leaf1 <$> allocKey k <*> u [])
+insertF k u (Leaf1 pk pv) = do
+  vpk <- fetchKeyT pk
+  Pure <$> case compare k vpk of
     LT -> do
-      v <- u []
-      l <- addFrame $ Leaf1 pk pv
-      r <- addFrame $ Leaf1 qk qv
-      return $ Carry l k v r
-    EQ -> do
-      v <- u qv
-      return $ Pure $ Leaf2 pk pv k v
+      kp <- allocKey k
+      (\v -> Leaf2 kp v pk pv) <$> u []
+    EQ -> Leaf1 pk <$> u pv
     GT -> do
-      v <- u []
-      l <- addFrame $ Leaf1 pk pv
-      r <- addFrame $ Leaf1 k v
-      return $ Carry l qk qv r
-insertF k u (Node2 l pk0 pv0 r) = case compare k pk0 of
-  LT -> do
-    fl <- fetch l
-    insertF k u fl >>= \case
-      Pure l' -> do
-        l'' <- addFrame l'
-        return $ Pure $ Node2 l'' pk0 pv0 r
-      Carry l' ck cv r' -> return $ Pure $ Node3 l' ck cv r' pk0 pv0 r
-  EQ -> do
-    v <- u pv0
-    return $ Pure $ Node2 l k v r
-  GT -> do
-    fr <- fetch r
-    insertF k u fr >>= \case
-      Pure r' -> do
-        r'' <- addFrame r'
-        return $ Pure $ Node2 l pk0 pv0 r''
-      Carry l' ck cv r' -> return $ Pure $ Node3 l pk0 pv0 l' ck cv r'
-insertF k u (Node3 l pk0 pv0 m qk0 qv0 r) = case compare k pk0 of
-  LT -> do
-    fl <- fetch l
-    insertF k u fl >>= \case
-      Pure l' -> do
-        l'' <- addFrame l'
-        return $ Pure $ Node3 l'' pk0 pv0 m qk0 qv0 r
-      Carry l' ck cv r' -> do
-        bl <- addFrame (Node2 l' ck cv r')
-        br <- addFrame (Node2 m qk0 qv0 r)
-        return $ Pure $ Node2 bl pk0 pv0 br
-  EQ -> do
-    v <- u pv0
-    return $ Pure $ Node3 l k v m qk0 qv0 r
-  GT -> case compare k qk0 of
+      kp <- allocKey k
+      Leaf2 pk pv kp <$> u []
+insertF k u (Leaf2 pk pv qk qv) = do
+  vpk <- fetchKeyT pk
+  case compare k vpk of
     LT -> do
-      fm <- fetch m
-      insertF k u fm >>= \case
-        Pure m' -> do
-          m'' <- addFrame m'
-          return $ Pure $ Node3 l pk0 pv0 m'' qk0 qv0 r
-        Carry l' ck cv r' -> do
-          bl <- addFrame $ Node2 l pk0 pv0 l'
-          br <- addFrame $ Node2 r' qk0 qv0 r
-          return $ Pure $ Node2 bl ck cv br
+      v <- u []
+      kp <- allocKey k
+      l <- addFrame $ Leaf1 kp v
+      r <- addFrame $ Leaf1 qk qv
+      return $ Carry l pk pv r
     EQ -> do
-      v <- u qv0
-      return $ Pure $ Node3 l pk0 pv0 m k v r
+      v <- u pv
+      return $ Pure $ Leaf2 pk v qk qv
+    GT -> do
+      vqk <- fetchKeyT qk
+      case compare k vqk of
+        LT -> do
+          v <- u []
+          l <- addFrame $ Leaf1 pk pv
+          r <- addFrame $ Leaf1 qk qv
+          kp <- allocKey k
+          return $ Carry l kp v r
+        EQ -> do
+          v <- u qv
+          return $ Pure $ Leaf2 pk pv qk v
+        GT -> do
+          v <- u []
+          kp <- allocKey k
+          l <- addFrame $ Leaf1 pk pv
+          r <- addFrame $ Leaf1 kp v
+          return $ Carry l qk qv r
+insertF k u (Node2 l pk0 pv0 r) = do
+  vpk0 <- fetchKeyT pk0
+  case compare k vpk0 of
+    LT -> do
+      fl <- fetch l
+      insertF k u fl >>= \case
+        Pure l' -> do
+          l'' <- addFrame l'
+          return $ Pure $ Node2 l'' pk0 pv0 r
+        Carry l' ck cv r' -> return $ Pure $ Node3 l' ck cv r' pk0 pv0 r
+    EQ -> do
+      v <- u pv0
+      return $ Pure $ Node2 l pk0 v r
     GT -> do
       fr <- fetch r
       insertF k u fr >>= \case
         Pure r' -> do
           r'' <- addFrame r'
-          return $ Pure $ Node3 l pk0 pv0 m qk0 qv0 r''
+          return $ Pure $ Node2 l pk0 pv0 r''
+        Carry l' ck cv r' -> return $ Pure $ Node3 l pk0 pv0 l' ck cv r'
+insertF k u (Node3 l pk0 pv0 m qk0 qv0 r) = do
+  vpk0 <- fetchKeyT pk0
+  case compare k vpk0 of
+    LT -> do
+      fl <- fetch l
+      insertF k u fl >>= \case
+        Pure l' -> do
+          l'' <- addFrame l'
+          return $ Pure $ Node3 l'' pk0 pv0 m qk0 qv0 r
         Carry l' ck cv r' -> do
-          bl <- addFrame $ Node2 l pk0 pv0 m
-          br <- addFrame $ Node2 l' ck cv r'
-          return $ Pure $ Node2 bl qk0 qv0 br
-insertF _ _ (Payload _) = fail "Impossible"
-insertF _ _ (Tree _ _ _) = fail "Impossible"
+          bl <- addFrame (Node2 l' ck cv r')
+          br <- addFrame (Node2 m qk0 qv0 r)
+          return $ Pure $ Node2 bl pk0 pv0 br
+    EQ -> do
+      v <- u pv0
+      return $ Pure $ Node3 l pk0 v m qk0 qv0 r
+    GT -> do
+      vqk0 <- fetchKeyT qk0
+      case compare k vqk0 of
+        LT -> do
+          fm <- fetch m
+          insertF k u fm >>= \case
+            Pure m' -> do
+              m'' <- addFrame m'
+              return $ Pure $ Node3 l pk0 pv0 m'' qk0 qv0 r
+            Carry l' ck cv r' -> do
+              bl <- addFrame $ Node2 l pk0 pv0 l'
+              br <- addFrame $ Node2 r' qk0 qv0 r
+              return $ Pure $ Node2 bl ck cv br
+        EQ -> do
+          v <- u qv0
+          return $ Pure $ Node3 l pk0 pv0 m qk0 v r
+        GT -> do
+          fr <- fetch r
+          insertF k u fr >>= \case
+            Pure r' -> do
+              r'' <- addFrame r'
+              return $ Pure $ Node3 l pk0 pv0 m qk0 qv0 r''
+            Carry l' ck cv r' -> do
+              bl <- addFrame $ Node2 l pk0 pv0 m
+              br <- addFrame $ Node2 l' ck cv r'
+              return $ Pure $ Node2 bl qk0 qv0 br
+insertF _ _ (Tree _ _ _ _) = fail "Unexpected Tree"
+insertF _ _ (Leaf _ _) = fail "Unexpected Leaf"
 
-testRead :: FilePath -> Key -> Int -> Int -> IO ()
-testRead path k i j = withBinaryFile path ReadMode $ \h -> do
-  root <- fetchRoot h
-  dumpFrame root
-  queryRange h root k i j
+querySearch :: Handle
+  -> Frame RawPointer
+  -> Key
+  -> (Tag -> Bool) -- drop while
+  -> (Tag -> Bool) -- take while
+  -> IO [(Tag, RawPointer)]
+querySearch h root key dwhile twhile = do
+  spine <- lookupSpine h key root >>= \case
+    Nothing -> fail "Not found"
+    Just s -> return s
+  let dropSpine (t0 : ts@((siz, t) : xs)) = fetchRaw h t >>= \case
+        Leaf tag _
+          | dwhile tag -> dropSpine xs
+          | otherwise -> dropTree t0 ts
+        Tree tag _ l r
+          | dwhile tag -> dropSpine $ (siz', l) : (siz', r) : xs
+          | otherwise -> dropTree t0 ts
+        _ -> error "unexpected frame"
+        where
+          siz' = siz `div` 2
+      dropSpine (t : ts) = dropTree t ts
+      dropSpine [] = return []
+      dropTree (siz, t) ts = fetchRaw h t >>= \case
+        Leaf tag p
+          | dwhile tag -> dropSpine ts
+          | otherwise -> takeSpine ts [(tag, p)]
+        Tree tag p l r
+          | dwhile tag -> dropSpine $ (siz', l) : (siz', r) : ts
+          | otherwise -> takeSpine ((siz', l) : (siz', r) : ts) [(tag, p)]
+        _ -> error "unexpected frame"
+        where
+          siz' = siz `div` 2
 
-queryRange :: Handle -> Frame RawPointer -> Key -> Int -> Int -> IO ()
+      takeSpine :: Spine RawPointer -> [(Tag, RawPointer)] -> IO [(Tag, RawPointer)]
+      takeSpine (t0 : ((siz, t) : xs)) ps = fetchRaw h t >>= \case
+        Leaf tag p
+          | twhile tag -> takeAll h (snd t0) ps >>= takeSpine xs . ((tag, p):)
+          | otherwise -> takeTree t0 ps
+        Tree tag p l r
+          | twhile tag -> takeAll h (snd t0) ps
+            >>= takeSpine ((siz', l) : (siz', r) : xs) . ((tag, p):)
+          | otherwise -> takeTree t0 ps
+        _ -> error "unexpected frame"
+        where
+          siz' = siz `div` 2
+      takeSpine [t] ps = takeTree t ps
+      takeSpine [] ps = return ps
+      takeTree (siz, t) ps = fetchRaw h t >>= \case
+        Leaf tag p
+          | twhile tag -> return $ (tag, p) : ps
+          | otherwise -> return ps
+        Tree tag p l r
+          | twhile tag -> takeSpine [(siz', l), (siz', r)] ((tag, p) : ps)
+          | otherwise -> return ps
+        _ -> error "unexpected frame"
+        where
+          siz' = siz `div` 2
+
+  dropSpine spine
+
+queryRange :: Handle -> Frame RawPointer -> Key -> Int -> Int -> IO [(Tag, RawPointer)]
 queryRange h root key offset wanted = do
   spine <- lookupSpine h key root >>= \case
     Nothing -> fail "Not found"
     Just s -> return s
-
-  let dropSpine :: Int -> Spine RawPointer -> IO ()
+  let dropSpine :: Int -> Spine RawPointer -> IO [(Tag, RawPointer)]
+      dropSpine _ [] = return []
       dropSpine n ((siz, t) : xs)
         | siz <= n = dropSpine (n - siz) xs
         | otherwise = dropTree n siz t xs
 
-      dropTree :: Int -> Int -> RawPointer -> Spine RawPointer -> IO ()
-      dropTree 0 siz t xs = takeSpine wanted ((siz, t) : xs)
+      dropTree :: Int -> Int -> RawPointer -> Spine RawPointer -> IO [(Tag, RawPointer)]
+      dropTree 0 siz t xs = takeSpine wanted ((siz, t) : xs) []
       dropTree n siz t xs = fetchRaw h t >>= \case
-        Tree p l r
-          | n == 1 -> takeSpine wanted ((siz', l) : (siz', r) : xs)
-          | n < siz' -> dropTree n siz' l ((siz', r) : xs)
+        Tree _ _ l r
+          | n == 1 -> takeSpine wanted ((siz', l) : (siz', r) : xs) []
+          | n < siz' -> dropTree (n - 1) siz' l ((siz', r) : xs)
           | otherwise -> dropTree (n - siz' - 1) siz' r xs
+        _ -> error "dropTree: unexpected frame"
         where
-          siz' = pred siz `div` 2
+          siz' = siz `div` 2
 
-      takeSpine :: Int -> Spine RawPointer -> IO ()
-      takeSpine _ [] = return ()
-      takeSpine n ((siz, t) : xs)
-        | n >= siz = takeAll t >> takeSpine (n - siz) xs
-        | otherwise = takeTree n siz t
+      takeSpine :: Int -> Spine RawPointer -> [(Tag, RawPointer)] -> IO [(Tag, RawPointer)]
+      takeSpine n _ ps | n <= 0 = return ps
+      takeSpine _ [] ps = return ps
+      takeSpine n ((siz, t) : xs) ps
+        | n >= siz = takeAll h t ps >>= takeSpine (n - siz) xs
+        | otherwise = takeTree n siz t ps
 
-      takeTree n siz t = fetchRaw h t >>= \case
-        Tree p l r
-          | n == 1 -> fetchRaw h p >>= dumpFrame
-          | n < siz' -> takeTree n siz' l
+      takeTree n _ _ ps | n <= 0 = return ps
+      takeTree n siz t ps = fetchRaw h t >>= \case
+        Tree tag p l r
+          | n == 1 -> return ((tag, p) : ps)
+          | n <= siz' -> takeTree (n - 1) siz' l ((tag, p) : ps)
           | otherwise -> do
-            fetchRaw h p >>= dumpFrame
-            takeAll l
-            takeTree (n - siz' - 1) siz' r
+            ps' <- takeAll h l ((tag, p) : ps)
+            takeTree (n - siz' - 1) siz' r ps'
+        Leaf tag p -> return ((tag, p) : ps)
+        _ -> error "takeTree: unexpected frame"
         where
-          siz' = pred siz `div` 2
-      takeAll t = fetchRaw h t >>= \case
-        Tree p l r -> do
-          fetchRaw h p >>= dumpFrame
-          takeAll l
-          takeAll r
-        Payload e -> print $ WB.toByteString e
+          siz' = siz `div` 2
 
   dropSpine offset spine
 
-dumpFrame = print
+testRead :: FilePath -> Key -> Int -> Int -> IO ()
+testRead path key ofs count = withFile path ReadMode $ \h -> do
+  root <- fetchRoot h
+  availableKeys h root >>= print
+  ps <- queryRange h root key ofs count
+  forM_ ps $ \(_, (ofs, len)) -> do
+    hSeek h AbsoluteSeek (fromIntegral ofs)
+    B.hGet h len >>= B.putStrLn
+
+availableKeys :: Handle -> Frame RawPointer -> IO [Key]
+availableKeys h (Leaf1 k _) = pure <$> fetchKey h k
+availableKeys h (Leaf2 j _ k _) = sequence [fetchKey h j, fetchKey h k]
+availableKeys h (Node2 l k _ r) = do
+  lks <- fetchRaw h l >>= availableKeys h
+  vk <- fetchKey h k
+  rks <- fetchRaw h r >>= availableKeys h
+  return $ lks ++ vk : rks
+availableKeys h (Node3 l j _ m k _ r) = do
+  lks <- fetchRaw h l >>= availableKeys h
+  vj <- fetchKey h j
+  mks <- fetchRaw h m >>= availableKeys h
+  vk <- fetchKey h k
+  rks <- fetchRaw h r >>= availableKeys h
+  return $ lks ++ vj : mks ++ vk : rks
+
+takeAll :: Handle -> RawPointer -> [(Tag, RawPointer)] -> IO [(Tag, RawPointer)]
+takeAll h t ps = fetchRaw h t >>= \case
+  Tree tag p l r -> takeAll h l ((tag, p) : ps) >>= takeAll h r
+  Leaf tag p -> return ((tag, p) : ps)
+  _ -> error "takeAll: unexpected frame"
