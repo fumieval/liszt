@@ -41,6 +41,7 @@ import Data.Proxy
 import Data.Winery
 import qualified Data.Winery.Internal.Builder as WB
 import GHC.Generics (Generic)
+import System.Directory
 import System.IO
 
 type Key = B.ByteString
@@ -73,7 +74,9 @@ data LisztHandle = LisztHandle
 
 openLiszt :: MonadIO m => FilePath -> m LisztHandle
 openLiszt path = liftIO $ do
+  exist <- doesFileExist path
   hPayload <- openBinaryFile path ReadWriteMode
+  unless exist $ B.hPutStr hPayload $ B.replicate footerSize 0
   keyCache <- newIORef IM.empty
   return LisztHandle{..}
 
