@@ -10,14 +10,18 @@ module Database.Liszt.Internal (
   , footerSize
   , decodeFrame
   -- * Writing
+  , clear
   , insert
   , commit
   -- * Reading
-  , queryRange
-  , querySearch
+  , availableKeys
+  , lookupSpine
+  , takeSpine
+  , dropSpine
+  , takeSpineWhile
+  , dropSpineWhile
   ) where
 
-import Control.Monad
 import Control.Monad.IO.Class
 import Control.Monad.Trans.State.Strict
 import qualified Data.ByteString as B
@@ -38,6 +42,8 @@ type Spine a = [(Int, a)]
 
 newtype KeyPointer = KeyPointer RawPointer deriving Serialise
 
+type RawPointer = (Int, Int)
+
 data Frame a = Empty
   | Leaf1 !KeyPointer !(Spine a)
   | Leaf2 !KeyPointer !(Spine a) !KeyPointer !(Spine a)
@@ -46,6 +52,15 @@ data Frame a = Empty
   | Tree !Tag !RawPointer !a !a
   | Leaf !Tag !RawPointer
   deriving (Generic, Functor)
+
+instance Serialise a => Serialise (Frame a)
+
+clear :: Key -> Transaction ()
+clear key = do
+  root <- gets currentRoot
+  insertF key (const $ return []) root >>= \case
+    Pure t -> modify $ \ts -> ts { currentRoot = t }
+    Carry l k a r -> modify $ \ts -> ts { currentRoot = Node2 l k a r }
 
 insert :: Key -> B.ByteString -> Encoding -> Transaction ()
 insert key tag payload = do
@@ -57,8 +72,6 @@ insert key tag payload = do
   insertF key (insertSpine tag (ofs, WB.getSize payload)) root >>= \case
     Pure t -> modify $ \ts -> ts { currentRoot = t }
     Carry l k a r -> modify $ \ts -> ts { currentRoot = Node2 l k a r }
-
-type RawPointer = (Int, Int)
 
 footerSize :: Int
 footerSize = 256
@@ -174,8 +187,6 @@ lookupSpine h k (Node3 l p u m q v r) = do
         GT -> fetchRaw h r >>= lookupSpine h k
 lookupSpine _ _ _ = return Nothing
 
-instance Serialise a => Serialise (Frame a)
-
 decodeFrame :: B.ByteString -> Frame RawPointer
 decodeFrame = either (error . show) id $ getDecoder
   $ schema (Proxy :: Proxy (Frame RawPointer))
@@ -183,10 +194,10 @@ decodeFrame = either (error . show) id $ getDecoder
 data Pointer = Commited !RawPointer | Uncommited !Int
 
 data TransactionState = TS
-  { dbHandle :: Handle
-  , freshId :: Int
-  , pending :: Map.Map Int (Frame Pointer)
-  , currentRoot :: Frame Pointer
+  { dbHandle :: !Handle
+  , freshId :: !Int
+  , pending :: !(Map.Map Int (Frame Pointer))
+  , currentRoot :: !(Frame Pointer)
   }
 
 type Transaction = StateT TransactionState IO
@@ -325,120 +336,8 @@ insertF k u (Node3 l pk0 pv0 m qk0 qv0 r) = do
 insertF _ _ (Tree _ _ _ _) = fail "Unexpected Tree"
 insertF _ _ (Leaf _ _) = fail "Unexpected Leaf"
 
-querySearch :: Handle
-  -> Frame RawPointer
-  -> Key
-  -> (Tag -> Bool) -- drop while
-  -> (Tag -> Bool) -- take while
-  -> IO [(Tag, RawPointer)]
-querySearch h root key dwhile twhile = do
-  spine <- lookupSpine h key root >>= \case
-    Nothing -> fail "Not found"
-    Just s -> return s
-  let dropSpine (t0 : ts@((siz, t) : xs)) = fetchRaw h t >>= \case
-        Leaf tag _
-          | dwhile tag -> dropSpine xs
-          | otherwise -> dropTree t0 ts
-        Tree tag _ l r
-          | dwhile tag -> dropSpine $ (siz', l) : (siz', r) : xs
-          | otherwise -> dropTree t0 ts
-        _ -> error "unexpected frame"
-        where
-          siz' = siz `div` 2
-      dropSpine (t : ts) = dropTree t ts
-      dropSpine [] = return []
-      dropTree (siz, t) ts = fetchRaw h t >>= \case
-        Leaf tag p
-          | dwhile tag -> dropSpine ts
-          | otherwise -> takeSpine ts [(tag, p)]
-        Tree tag p l r
-          | dwhile tag -> dropSpine $ (siz', l) : (siz', r) : ts
-          | otherwise -> takeSpine ((siz', l) : (siz', r) : ts) [(tag, p)]
-        _ -> error "unexpected frame"
-        where
-          siz' = siz `div` 2
-
-      takeSpine :: Spine RawPointer -> [(Tag, RawPointer)] -> IO [(Tag, RawPointer)]
-      takeSpine (t0 : ((siz, t) : xs)) ps = fetchRaw h t >>= \case
-        Leaf tag p
-          | twhile tag -> takeAll h (snd t0) ps >>= takeSpine xs . ((tag, p):)
-          | otherwise -> takeTree t0 ps
-        Tree tag p l r
-          | twhile tag -> takeAll h (snd t0) ps
-            >>= takeSpine ((siz', l) : (siz', r) : xs) . ((tag, p):)
-          | otherwise -> takeTree t0 ps
-        _ -> error "unexpected frame"
-        where
-          siz' = siz `div` 2
-      takeSpine [t] ps = takeTree t ps
-      takeSpine [] ps = return ps
-      takeTree (siz, t) ps = fetchRaw h t >>= \case
-        Leaf tag p
-          | twhile tag -> return $ (tag, p) : ps
-          | otherwise -> return ps
-        Tree tag p l r
-          | twhile tag -> takeSpine [(siz', l), (siz', r)] ((tag, p) : ps)
-          | otherwise -> return ps
-        _ -> error "unexpected frame"
-        where
-          siz' = siz `div` 2
-
-  dropSpine spine
-
-queryRange :: Handle -> Frame RawPointer -> Key -> Int -> Int -> IO [(Tag, RawPointer)]
-queryRange h root key offset wanted = do
-  spine <- lookupSpine h key root >>= \case
-    Nothing -> fail "Not found"
-    Just s -> return s
-  let dropSpine :: Int -> Spine RawPointer -> IO [(Tag, RawPointer)]
-      dropSpine _ [] = return []
-      dropSpine n ((siz, t) : xs)
-        | siz <= n = dropSpine (n - siz) xs
-        | otherwise = dropTree n siz t xs
-
-      dropTree :: Int -> Int -> RawPointer -> Spine RawPointer -> IO [(Tag, RawPointer)]
-      dropTree 0 siz t xs = takeSpine wanted ((siz, t) : xs) []
-      dropTree n siz t xs = fetchRaw h t >>= \case
-        Tree _ _ l r
-          | n == 1 -> takeSpine wanted ((siz', l) : (siz', r) : xs) []
-          | n < siz' -> dropTree (n - 1) siz' l ((siz', r) : xs)
-          | otherwise -> dropTree (n - siz' - 1) siz' r xs
-        _ -> error "dropTree: unexpected frame"
-        where
-          siz' = siz `div` 2
-
-      takeSpine :: Int -> Spine RawPointer -> [(Tag, RawPointer)] -> IO [(Tag, RawPointer)]
-      takeSpine n _ ps | n <= 0 = return ps
-      takeSpine _ [] ps = return ps
-      takeSpine n ((siz, t) : xs) ps
-        | n >= siz = takeAll h t ps >>= takeSpine (n - siz) xs
-        | otherwise = takeTree n siz t ps
-
-      takeTree n _ _ ps | n <= 0 = return ps
-      takeTree n siz t ps = fetchRaw h t >>= \case
-        Tree tag p l r
-          | n == 1 -> return ((tag, p) : ps)
-          | n <= siz' -> takeTree (n - 1) siz' l ((tag, p) : ps)
-          | otherwise -> do
-            ps' <- takeAll h l ((tag, p) : ps)
-            takeTree (n - siz' - 1) siz' r ps'
-        Leaf tag p -> return ((tag, p) : ps)
-        _ -> error "takeTree: unexpected frame"
-        where
-          siz' = siz `div` 2
-
-  dropSpine offset spine
-
-testRead :: FilePath -> Key -> Int -> Int -> IO ()
-testRead path key ofs count = withFile path ReadMode $ \h -> do
-  root <- fetchRoot h
-  availableKeys h root >>= print
-  ps <- queryRange h root key ofs count
-  forM_ ps $ \(_, (ofs, len)) -> do
-    hSeek h AbsoluteSeek (fromIntegral ofs)
-    B.hGet h len >>= B.putStrLn
-
 availableKeys :: Handle -> Frame RawPointer -> IO [Key]
+availableKeys _ Empty = return []
 availableKeys h (Leaf1 k _) = pure <$> fetchKey h k
 availableKeys h (Leaf2 j _ k _) = sequence [fetchKey h j, fetchKey h k]
 availableKeys h (Node2 l k _ r) = do
@@ -453,9 +352,106 @@ availableKeys h (Node3 l j _ m k _ r) = do
   vk <- fetchKey h k
   rks <- fetchRaw h r >>= availableKeys h
   return $ lks ++ vj : mks ++ vk : rks
+availableKeys _ _ = fail "availableKeys: unexpected frame"
 
-takeAll :: Handle -> RawPointer -> [(Tag, RawPointer)] -> IO [(Tag, RawPointer)]
+type QueryResult = [(Tag, RawPointer)]
+
+dropSpine :: Handle -> Int -> Spine RawPointer -> IO (Spine RawPointer)
+dropSpine _ _ [] = return []
+dropSpine h n0 ((siz0, t0) : xs0)
+  | siz0 <= n0 = dropSpine h (n0 - siz0) xs0
+  | otherwise = dropTree n0 siz0 t0 xs0
+  where
+    dropTree :: Int -> Int -> RawPointer -> Spine RawPointer -> IO (Spine RawPointer)
+    dropTree 0 siz t xs = return $ (siz, t) : xs
+    dropTree n siz t xs = fetchRaw h t >>= \case
+      Tree _ _ l r
+        | n == 1 -> return $ (siz', l) : (siz', r) : xs
+        | n < siz' -> dropTree (n - 1) siz' l ((siz', r) : xs)
+        | otherwise -> dropTree (n - siz' - 1) siz' r xs
+      _ -> error "dropTree: unexpected frame"
+      where
+        siz' = siz `div` 2
+
+takeSpine :: Handle -> Int -> Spine RawPointer -> QueryResult -> IO QueryResult
+takeSpine _ n _ ps | n <= 0 = return ps
+takeSpine _ _ [] ps = return ps
+takeSpine h n ((siz, t) : xs) ps
+  | n >= siz = takeAll h t ps >>= takeSpine h (n - siz) xs
+  | otherwise = takeTree h n siz t ps
+
+takeTree :: Handle -> Int -> Int -> RawPointer -> QueryResult -> IO QueryResult
+takeTree _ n _ _ ps | n <= 0 = return ps
+takeTree h n siz t ps = fetchRaw h t >>= \case
+  Tree tag p l r
+    | n == 1 -> return $ (tag, p) : ps
+    | n <= siz' -> takeTree h (n - 1) siz' l ((tag, p) : ps)
+    | otherwise -> do
+      ps' <- takeAll h l ((tag, p) : ps)
+      takeTree h (n - siz' - 1) siz' r ps'
+  Leaf tag p -> return $ (tag, p) : ps
+  _ -> error "takeTree: unexpected frame"
+  where
+    siz' = siz `div` 2
+
+takeAll :: Handle -> RawPointer -> QueryResult -> IO QueryResult
 takeAll h t ps = fetchRaw h t >>= \case
   Tree tag p l r -> takeAll h l ((tag, p) : ps) >>= takeAll h r
   Leaf tag p -> return ((tag, p) : ps)
   _ -> error "takeAll: unexpected frame"
+
+takeSpineWhile :: (Tag -> Bool) -> Handle -> Spine RawPointer -> QueryResult -> IO QueryResult
+takeSpineWhile cond h = go where
+  go (t0 : ((siz, t) : xs)) ps = fetchRaw h t >>= \case
+    Leaf tag p
+      | cond tag -> takeAll h (snd t0) ps >>= go xs . ((tag, p):)
+      | otherwise -> inner t0 ps
+    Tree tag p l r
+      | cond tag -> takeAll h (snd t0) ps
+        >>= go ((siz', l) : (siz', r) : xs) . ((tag, p):)
+      | otherwise -> inner t0 ps
+    _ -> error "unexpected frame"
+    where
+      siz' = siz `div` 2
+  go [t] ps = inner t ps
+  go [] ps = return ps
+
+  inner (siz, t) ps = fetchRaw h t >>= \case
+    Leaf tag p
+      | cond tag -> return $ (tag, p) : ps
+      | otherwise -> return ps
+    Tree tag p l r
+      | cond tag -> go [(siz', l), (siz', r)] ((tag, p) : ps)
+      | otherwise -> return ps
+    _ -> error "unexpected frame"
+    where
+      siz' = siz `div` 2
+
+dropSpineWhile :: (Tag -> Bool)
+  -> Handle
+  -> Spine RawPointer
+  -> IO (Maybe ((Tag, RawPointer), Spine RawPointer))
+dropSpineWhile cond h = go where
+  go (t0 : ts@((siz, t) : xs)) = fetchRaw h t >>= \case
+    Leaf tag _
+      | cond tag -> go xs
+      | otherwise -> dropTree t0 ts
+    Tree tag _ l r
+      | cond tag -> go $ (siz', l) : (siz', r) : xs
+      | otherwise -> dropTree t0 ts
+    _ -> error "unexpected frame"
+    where
+      siz' = siz `div` 2
+  go (t : ts) = dropTree t ts
+  go [] = return Nothing
+
+  dropTree (siz, t) ts = fetchRaw h t >>= \case
+    Leaf tag p
+      | cond tag -> go ts
+      | otherwise -> return $ Just ((tag, p), ts)
+    Tree tag p l r
+      | cond tag -> go $ (siz', l) : (siz', r) : ts
+      | otherwise -> return $ Just ((tag, p), (siz', l) : (siz', r) : ts)
+    _ -> error "unexpected frame"
+    where
+      siz' = siz `div` 2
