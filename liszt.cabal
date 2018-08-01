@@ -2,7 +2,7 @@
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: 2b76f6d1b33e4bc8e24d2120bb387224ca528686c4bba9d8e96ea13f73cb8ee4
+-- hash: 03d178083ab456022918b6a2df334cbd0e91d5117ccd7cb53a3db80e58724f6a
 
 name:           liszt
 version:        0.1.0.0
@@ -39,6 +39,7 @@ library
     , bytestring
     , containers
     , directory
+    , exceptions
     , filepath
     , fsnotify
     , network
@@ -62,6 +63,7 @@ executable liszt
     , bytestring
     , containers
     , directory
+    , exceptions
     , filepath
     , fsnotify
     , liszt
@@ -87,6 +89,7 @@ executable lisztd
     , bytestring
     , containers
     , directory
+    , exceptions
     , filepath
     , fsnotify
     , liszt

@@ -24,6 +24,7 @@ dependencies:
 - network
 - bytestring
 - directory
+- exceptions
 - filepath
 - fsnotify
 - sendfile

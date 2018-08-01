@@ -43,7 +43,7 @@ import System.IO
 import System.FSNotify
 
 commitFile :: FilePath -> Transaction () -> IO ()
-commitFile path m = withBinaryFile path ReadWriteMode $ \h -> commit h m
+commitFile path m = withLiszt path $ \h -> commit h m
 
 data RequestType = AllItems | LastItem deriving (Show, Generic)
 instance Binary RequestType
