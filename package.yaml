@@ -33,11 +33,13 @@ dependencies:
 - unordered-containers
 - stm
 - stm-delay
+- winery
 
 library:
   source-dirs: src
   exposed-modules:
     - Database.Liszt
+    - Database.Liszt.Internal
     - Database.Liszt.Network
 
 executables:
