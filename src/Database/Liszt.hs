@@ -1,7 +1,14 @@
 {-# LANGUAGE DeriveGeneric, RecordWildCards, LambdaCase, Rank2Types, ScopedTypeVariables #-}
 module Database.Liszt (
+    openLiszt,
+    closeLiszt,
+    withLiszt,
+    LisztHandle,
     -- * Writer interface
+    Key,
+    Tag,
     Transaction,
+    clear,
     insert,
     commit,
     commitFile,
