@@ -1,8 +1,8 @@
--- This file has been generated from package.yaml by hpack version 0.28.2.
+-- This file has been generated from package.yaml by hpack version 0.20.0.
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: a563f41cf3a93034fdbc7a7bfac7ca538cb7bde10e480d65986091a2580f5bd3
+-- hash: bddbf66b27dad5c227d696d3aef2985fe7fe88d8fcb75998d786ae5d970310a0
 
 name:           liszt
 version:        0.1.0.0
@@ -16,6 +16,7 @@ license:        BSD3
 license-file:   LICENSE
 build-type:     Simple
 cabal-version:  >= 1.10
+
 extra-source-files:
     ChangeLog.md
     README.md
@@ -25,11 +26,6 @@ source-repository head
   location: https://github.com/fumieval/liszt
 
 library
-  exposed-modules:
-      Database.Liszt
-      Database.Liszt.Network
-  other-modules:
-      Paths_liszt
   hs-source-dirs:
       src
   build-depends:
@@ -37,21 +33,32 @@ library
     , binary
     , bytestring
     , containers
+    , deepseq
     , directory
+    , exceptions
     , filepath
     , fsnotify
     , network
+    , reflection
+    , scientific
     , sendfile
     , stm
     , stm-delay
+    , text
     , transformers
     , unordered-containers
+    , winery
+  exposed-modules:
+      Database.Liszt
+      Database.Liszt.Tracker
+      Database.Liszt.Internal
+      Database.Liszt.Network
+  other-modules:
+      Paths_liszt
   default-language: Haskell2010
 
 executable liszt
   main-is: client.hs
-  other-modules:
-      Paths_liszt
   hs-source-dirs:
       app
   build-depends:
@@ -59,22 +66,28 @@ executable liszt
     , binary
     , bytestring
     , containers
+    , deepseq
     , directory
+    , exceptions
     , filepath
     , fsnotify
     , liszt
     , network
+    , reflection
+    , scientific
     , sendfile
     , stm
     , stm-delay
+    , text
     , transformers
     , unordered-containers
+    , winery
+  other-modules:
+      Paths_liszt
   default-language: Haskell2010
 
 executable lisztd
   main-is: server.hs
-  other-modules:
-      Paths_liszt
   hs-source-dirs:
       app
   ghc-options: -threaded
@@ -83,14 +96,22 @@ executable lisztd
     , binary
     , bytestring
     , containers
+    , deepseq
     , directory
+    , exceptions
     , filepath
     , fsnotify
     , liszt
     , network
+    , reflection
+    , scientific
     , sendfile
     , stm
     , stm-delay
+    , text
     , transformers
     , unordered-containers
+    , winery
+  other-modules:
+      Paths_liszt
   default-language: Haskell2010
