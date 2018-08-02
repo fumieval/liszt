@@ -49,7 +49,7 @@ import System.FilePath
 import System.IO
 import System.FSNotify
 
-commitFile :: FilePath -> Transaction () -> IO ()
+commitFile :: FilePath -> Transaction a -> IO a
 commitFile path m = withLiszt path $ \h -> commit h m
 
 data RequestType = AllItems | LastItem deriving (Show, Generic)

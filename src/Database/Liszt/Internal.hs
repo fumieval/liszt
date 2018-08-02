@@ -18,6 +18,7 @@ module Database.Liszt.Internal (
   -- * Internal
   , Frame
   , Spine
+  , spineLength
   , RawPointer
   , TransactionState
   , footerSize
@@ -233,6 +234,9 @@ lookupSpine h k (Node3 l p u m q v r) = do
         EQ -> return (Just v)
         GT -> fetchFrame h r >>= lookupSpine h k
 lookupSpine _ _ _ = return Nothing
+
+spineLength :: Spine a -> Int
+spineLength = sum . map fst
 
 decodeFrame :: B.ByteString -> Frame RawPointer
 decodeFrame = either (error . show) id $ getDecoder
