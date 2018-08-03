@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 module Database.Liszt.Network
   (startServer
   , Connection
@@ -10,8 +11,11 @@ import Control.Concurrent
 import Control.Exception
 import Control.Monad
 import Database.Liszt
+import Database.Liszt.Internal
 import Data.Binary
 import Data.Binary.Get
+import Data.Winery
+import qualified Data.Winery.Internal.Builder as WB
 import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.HashMap.Strict as HM
@@ -22,14 +26,19 @@ import System.IO
 
 respond :: LisztReader -> S.Socket -> IO ()
 respond env conn = do
-  msg <- BL.fromStrict <$> SB.recv conn 4096
-  (payloadHandle, offsets) <- case decodeOrFail msg of
-    Left _ -> throwIO MalformedRequest
-    Right (_, _, a) -> handleRequest env a
-  SB.sendAll conn $ BL.toStrict $ encode $ length offsets
-  forM_ offsets $ \(i, xs, pos, len) -> do
-    SB.sendAll conn $ BL.toStrict $ encode (i, HM.toList xs, len)
-    SF.sendFile' conn payloadHandle (fromIntegral pos) (fromIntegral len)
+  msg <- SB.recv conn 4096
+  req <- try (evaluate $ decodeCurrent msg) >>= \case
+    Left e -> throwIO $ WineryError e
+    Right a -> return a
+  unless (B.null msg) $ handleRequest env req $ \lh lastSeqNo offsets -> do
+    let count = length offsets
+    SB.sendAll conn $ encodeResp $ Right count
+    forM_ (zip [lastSeqNo - count + 1..] offsets) $ \(i, (tag, (pos, len))) -> do
+      SB.sendAll conn $ WB.toByteString $ mconcat
+        [ WB.word64 (fromIntegral i)
+        , WB.word64 (fromIntegral $ WB.getSize tag), tag
+        , WB.word64 $ fromIntegral len]
+      SF.sendFile' conn (hPayload lh) (fromIntegral pos) (fromIntegral len)
 
 startServer :: Int -> FilePath -> IO ()
 startServer port path = withLisztReader path $ \env -> do
@@ -46,10 +55,13 @@ startServer port path = withLisztReader path $ \env -> do
         $ \result -> do
           case result of
             Left ex -> case fromException ex of
-              Just e -> SB.sendAll conn $ B.pack $ show (e :: LisztError)
+              Just e -> SB.sendAll conn $ encodeResp $ Left $ show (e :: LisztError)
               Nothing -> hPutStrLn stderr $ show ex
             Right _ -> return ()
           S.close conn
+
+encodeResp :: Either String Int -> B.ByteString
+encodeResp = BL.toStrict . encode
 
 newtype Connection = Connection S.Socket
 
@@ -67,11 +79,12 @@ connect host port = do
 disconnect :: Connection -> IO ()
 disconnect (Connection sock) = S.close sock
 
-fetch :: Connection -> Request -> IO [(Int, IndexMap Int, B.ByteString)]
+fetch :: Connection -> Request -> IO [(Int, B.ByteString, B.ByteString)]
 fetch (Connection sock) req = do
-  SB.sendAll sock $ BL.toStrict $ encode req
-  go $ runGetIncremental $ get
-    >>= \n -> replicateM n ((,,) <$> get <*> fmap HM.fromList get <*> get)
+  SB.sendAll sock $ serialiseOnly req
+  go $ runGetIncremental $ get >>= \case
+    Left e -> throw (read e :: LisztError)
+    Right n -> replicateM n ((,,) <$> get <*> get <*> get)
   where
     go (Done _ _ a) = return a
     go (Partial cont) = do
