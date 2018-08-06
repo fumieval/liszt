@@ -33,7 +33,7 @@ respond env conn = do
   unless (B.null msg) $ handleRequest env req $ \lh lastSeqNo offsets -> do
     let count = length offsets
     SB.sendAll conn $ encodeResp $ Right count
-    forM_ (zip [lastSeqNo - count + 1..] offsets) $ \(i, (tag, (pos, len))) -> do
+    forM_ (zip [lastSeqNo - count + 1..] offsets) $ \(i, (tag, RP pos len)) -> do
       SB.sendAll conn $ WB.toByteString $ mconcat
         [ WB.word64 (fromIntegral i)
         , WB.word64 (fromIntegral $ WB.getSize tag), tag

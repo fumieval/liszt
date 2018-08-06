@@ -21,7 +21,7 @@ module Database.Liszt.Internal (
   , fetchRoot
   , Spine
   , spineLength
-  , RawPointer
+  , RawPointer(..)
   , TransactionState
   , footerSize
   , isFooter
@@ -35,6 +35,7 @@ module Database.Liszt.Internal (
   ) where
 
 import Control.Concurrent
+import Control.DeepSeq
 import Control.Exception (evaluate)
 import Control.Monad
 import Control.Monad.Catch
@@ -62,9 +63,12 @@ type Tag = WB.Encoding
 
 type Spine a = [(Int, a)]
 
-newtype KeyPointer = KeyPointer RawPointer deriving (Show, Eq, Serialise)
+newtype KeyPointer = KeyPointer RawPointer deriving (Show, Eq, Serialise, NFData)
 
-type RawPointer = (Int, Int)
+data RawPointer = RP !Int !Int deriving (Show, Eq, Generic)
+instance Serialise RawPointer
+instance NFData RawPointer where
+  rnf r = r `seq` ()
 
 data Frame a = Empty
   | Leaf1 !KeyPointer !(Spine a)
@@ -77,9 +81,16 @@ data Frame a = Empty
 
 instance Serialise a => Serialise (Frame a)
 
+forceSpine :: NFData a => Frame a -> ()
+forceSpine (Leaf1 _ s) = rnf s
+forceSpine (Leaf2 _ s _ t) = rnf s `seq` rnf t
+forceSpine (Node2 _ _ s _) = rnf s
+forceSpine (Node3 _ _ s _ _ t _) = rnf s `seq` rnf t
+forceSpine _ = ()
+
 data LisztHandle = LisztHandle
   { hPayload :: !Handle
-  , refBuffer :: IORef (Int, ForeignPtr Word8)
+  , refBuffer :: MVar (Int, ForeignPtr Word8)
   , keyCache :: IORef (IM.IntMap Key)
   , handleLock :: MVar ()
   }
@@ -90,7 +101,7 @@ openLiszt path = liftIO $ do
   hPayload <- openBinaryFile path ReadWriteMode
   unless exist $ B.hPutStr hPayload emptyFooter
   buf <- B.mallocByteString 4096
-  refBuffer <- newIORef (4096, buf)
+  refBuffer <- newMVar (4096, buf)
   keyCache <- newIORef IM.empty
   handleLock <- newMVar ()
   return LisztHandle{..}
@@ -127,7 +138,7 @@ insert key tag payload = do
   ofs <- liftIO $ fromIntegral <$> hTell h
   liftIO $ WB.hPut h payload
   root <- gets currentRoot
-  insertF key (insertSpine tag (ofs, WB.getSize payload)) root >>= \case
+  insertF key (insertSpine tag (ofs `RP` WB.getSize payload)) root >>= \case
     Pure t -> modify $ \ts -> ts { currentRoot = t, isModified = True }
     Carry l k a r -> modify $ \ts -> ts { currentRoot = Node2 l k a r, isModified = True }
 
@@ -154,10 +165,10 @@ allocKey key = do
     B.hPutStr h key
     modifyIORef' cache (IM.insert ofs key)
     return ofs
-  return $ KeyPointer (ofs, B.length key)
+  return $ KeyPointer $ RP ofs (B.length key)
 
 fetchKey :: LisztHandle -> KeyPointer -> IO Key
-fetchKey LisztHandle{..} (KeyPointer (ofs, len)) = do
+fetchKey LisztHandle{..} (KeyPointer (RP ofs len)) = do
   cache <- readIORef keyCache
   case IM.lookup ofs cache of
     Just key -> return key
@@ -179,7 +190,7 @@ commit h transaction = liftIO $ modifyMVar (handleLock h) $ const $ do
       substP (Uncommited i) = case Map.lookup i pendings of
         Just f -> substF f
         Nothing -> error "panic!"
-      substF Empty = return (0, 0)
+      substF Empty = return (RP 0 0)
       substF (Leaf1 pk pv) = do
         pv' <- traverse (traverse substP) pv
         write (Leaf1 pk pv')
@@ -208,7 +219,7 @@ commit h transaction = liftIO $ modifyMVar (handleLock h) $ const $ do
   when modified $ do
     hSeek h' SeekFromEnd 0
     offset0 <- fromIntegral <$> hTell h'
-    (_, len) <- evalStateT (substF root') offset0
+    RP _ len <- evalStateT (substF root') offset0
     B.hPutStr h' $ B.drop len emptyFooter
     hFlush h'
   return ((), a)
@@ -220,7 +231,7 @@ commit h transaction = liftIO $ modifyMVar (handleLock h) $ const $ do
       let e = toEncoding f
       liftIO $ WB.hPut h' e
       put $! ofs + WB.getSize e
-      return (ofs, WB.getSize e)
+      return $ RP ofs (WB.getSize e)
 
 lookupSpine :: LisztHandle -> Key -> Frame RawPointer -> IO (Maybe (Spine RawPointer))
 lookupSpine h k (Leaf1 p v) = do
@@ -263,19 +274,20 @@ addFrame f = state $ \ts -> (Uncommited (freshId ts), ts
   , pending = Map.insert (freshId ts) f (pending ts) })
 
 fetchFrame' :: LisztHandle -> Int -> IO (Frame RawPointer)
-fetchFrame' h len = do
-  (blen, buf) <- readIORef (refBuffer h)
-  buf' <- if blen < len
+fetchFrame' h len = modifyMVar (refBuffer h) $ \(blen, buf) -> do
+  (blen', buf') <- if blen < len
     then do
       buf' <- B.mallocByteString len
-      writeIORef (refBuffer h) (len, buf')
-      return buf'
-    else return buf
-  _ <- withForeignPtr buf' $ \ptr -> hGetBuf (hPayload h) ptr len
-  evaluate $ decodeFrame $ B.PS buf' 0 len
+      return (len, buf')
+    else return (blen, buf)
+  f <- withForeignPtr buf' $ \ptr -> do
+    hGetBuf (hPayload h) ptr len
+    let f = decodeFrame $ B.PS buf' 0 len
+    forceSpine f `seq` return f
+  return ((blen', buf'), f)
 
 fetchFrame :: LisztHandle -> RawPointer -> IO (Frame RawPointer)
-fetchFrame h (ofs, len) = do
+fetchFrame h (RP ofs len) = do
   hSeek (hPayload h) AbsoluteSeek (fromIntegral ofs)
   fetchFrame' h len
 

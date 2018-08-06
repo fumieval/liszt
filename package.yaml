@@ -21,6 +21,7 @@ description:         Please see the README on GitHub at <https://github.com/fumi
 
 dependencies:
 - base >= 4.7 && < 5
+- deepseq
 - network
 - bytestring
 - directory
@@ -35,6 +36,8 @@ dependencies:
 - stm
 - stm-delay
 - winery
+- text
+- scientific
 
 library:
   source-dirs: src

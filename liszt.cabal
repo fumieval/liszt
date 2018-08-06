@@ -1,8 +1,8 @@
--- This file has been generated from package.yaml by hpack version 0.28.2.
+-- This file has been generated from package.yaml by hpack version 0.20.0.
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: 03d178083ab456022918b6a2df334cbd0e91d5117ccd7cb53a3db80e58724f6a
+-- hash: fb7a2c64dcc94c373be4d4572d74b98ad4de7bb10add6a4b4aab6bfa9825a04c
 
 name:           liszt
 version:        0.1.0.0
@@ -16,6 +16,7 @@ license:        BSD3
 license-file:   LICENSE
 build-type:     Simple
 cabal-version:  >= 1.10
+
 extra-source-files:
     ChangeLog.md
     README.md
@@ -25,12 +26,6 @@ source-repository head
   location: https://github.com/fumieval/liszt
 
 library
-  exposed-modules:
-      Database.Liszt
-      Database.Liszt.Internal
-      Database.Liszt.Network
-  other-modules:
-      Paths_liszt
   hs-source-dirs:
       src
   build-depends:
@@ -38,6 +33,7 @@ library
     , binary
     , bytestring
     , containers
+    , deepseq
     , directory
     , exceptions
     , filepath
@@ -51,12 +47,16 @@ library
     , transformers
     , unordered-containers
     , winery
+  exposed-modules:
+      Database.Liszt
+      Database.Liszt.Internal
+      Database.Liszt.Network
+  other-modules:
+      Paths_liszt
   default-language: Haskell2010
 
 executable liszt
   main-is: client.hs
-  other-modules:
-      Paths_liszt
   hs-source-dirs:
       app
   build-depends:
@@ -64,24 +64,27 @@ executable liszt
     , binary
     , bytestring
     , containers
+    , deepseq
     , directory
     , exceptions
     , filepath
     , fsnotify
     , liszt
     , network
+    , scientific
     , sendfile
     , stm
     , stm-delay
+    , text
     , transformers
     , unordered-containers
     , winery
+  other-modules:
+      Paths_liszt
   default-language: Haskell2010
 
 executable lisztd
   main-is: server.hs
-  other-modules:
-      Paths_liszt
   hs-source-dirs:
       app
   ghc-options: -threaded
@@ -90,16 +93,21 @@ executable lisztd
     , binary
     , bytestring
     , containers
+    , deepseq
     , directory
     , exceptions
     , filepath
     , fsnotify
     , liszt
     , network
+    , scientific
     , sendfile
     , stm
     , stm-delay
+    , text
     , transformers
     , unordered-containers
     , winery
+  other-modules:
+      Paths_liszt
   default-language: Haskell2010
