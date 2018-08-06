@@ -41,12 +41,15 @@ import Control.Monad.Catch
 import Control.Monad.IO.Class
 import Control.Monad.Trans.State.Strict
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Internal as B
 import qualified Data.Map.Strict as Map
 import qualified Data.IntMap.Strict as IM
 import Data.IORef
 import Data.Proxy
+import Data.Word
 import Data.Winery
 import qualified Data.Winery.Internal.Builder as WB
+import Foreign.ForeignPtr
 import GHC.Generics (Generic)
 import System.Directory
 import System.IO
@@ -76,6 +79,7 @@ instance Serialise a => Serialise (Frame a)
 
 data LisztHandle = LisztHandle
   { hPayload :: !Handle
+  , refBuffer :: IORef (Int, ForeignPtr Word8)
   , keyCache :: IORef (IM.IntMap Key)
   , handleLock :: MVar ()
   }
@@ -85,12 +89,14 @@ openLiszt path = liftIO $ do
   exist <- doesFileExist path
   hPayload <- openBinaryFile path ReadWriteMode
   unless exist $ B.hPutStr hPayload emptyFooter
+  buf <- B.mallocByteString 4096
+  refBuffer <- newIORef (4096, buf)
   keyCache <- newIORef IM.empty
   handleLock <- newMVar ()
   return LisztHandle{..}
 
 closeLiszt :: MonadIO m => LisztHandle -> m ()
-closeLiszt (LisztHandle h _ _) = liftIO $ hClose h
+closeLiszt (LisztHandle h _ _ _) = liftIO $ hClose h
 
 withLiszt :: (MonadIO m, MonadMask m) => FilePath -> (LisztHandle -> m a) -> m a
 withLiszt path = bracket (openLiszt path) closeLiszt
@@ -116,7 +122,7 @@ clear key = do
 
 insert :: Key -> Tag -> Encoding -> Transaction ()
 insert key tag payload = do
-  LisztHandle h _ _ <- gets dbHandle
+  LisztHandle h _ _ _ <- gets dbHandle
   liftIO $ hSeek h SeekFromEnd 0
   ofs <- liftIO $ fromIntegral <$> hTell h
   liftIO $ WB.hPut h payload
@@ -135,16 +141,13 @@ isFooter :: B.ByteString -> Bool
 isFooter bs = B.drop 128 bs == B.drop 128 emptyFooter
 
 fetchRoot :: LisztHandle -> IO (Frame RawPointer)
-fetchRoot (LisztHandle h _ _) = do
-  hSeek h SeekFromEnd (-fromIntegral footerSize)
-  bs <- B.hGetSome h footerSize
-  if B.length bs == 0
-    then return Empty
-    else return $! decodeFrame bs
+fetchRoot h = do
+  hSeek (hPayload h) SeekFromEnd (-fromIntegral footerSize)
+  fetchFrame' h footerSize
 
 allocKey :: Key -> Transaction KeyPointer
 allocKey key = do
-  LisztHandle h cache _ <- gets dbHandle
+  LisztHandle h _ cache _ <- gets dbHandle
   ofs <- liftIO $ do
     hSeek h SeekFromEnd 0
     ofs <- fromIntegral <$> hTell h
@@ -259,13 +262,22 @@ addFrame f = state $ \ts -> (Uncommited (freshId ts), ts
   { freshId = freshId ts + 1
   , pending = Map.insert (freshId ts) f (pending ts) })
 
+fetchFrame' :: LisztHandle -> Int -> IO (Frame RawPointer)
+fetchFrame' h len = do
+  (blen, buf) <- readIORef (refBuffer h)
+  buf' <- if blen < len
+    then do
+      buf' <- B.mallocByteString len
+      writeIORef (refBuffer h) (len, buf')
+      return buf'
+    else return buf
+  _ <- withForeignPtr buf' $ \ptr -> hGetBuf (hPayload h) ptr len
+  evaluate $ decodeFrame $ B.PS buf' 0 len
+
 fetchFrame :: LisztHandle -> RawPointer -> IO (Frame RawPointer)
 fetchFrame h (ofs, len) = do
   hSeek (hPayload h) AbsoluteSeek (fromIntegral ofs)
-  bs <- B.hGet (hPayload h) len
-  try (evaluate (decodeFrame bs)) >>= \case
-    Left e -> fail $ show (e :: DecodeException) ++ show (ofs, len, bs)
-    Right a -> return a
+  fetchFrame' h len
 
 fetchStage :: Pointer -> Transaction (Frame Pointer)
 fetchStage (Commited p) = do
