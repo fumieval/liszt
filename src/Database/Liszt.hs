@@ -113,7 +113,7 @@ createStream man path = do
                 Left (e :: DecodeException) -> do
                   wait
                   seekRoot 0
-                Right a -> return a
+                Right a -> forceSpine a
               else do
                 wait
                 seekRoot 0

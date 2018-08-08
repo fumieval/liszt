@@ -18,6 +18,7 @@ module Database.Liszt.Internal (
   , availableKeys
   -- * Internal
   , Frame(..)
+  , forceSpine
   , fetchRoot
   , Spine
   , spineLength
@@ -170,9 +171,8 @@ isFooter :: B.ByteString -> Bool
 isFooter bs = B.drop 128 bs == B.drop 128 emptyFooter
 
 fetchRoot :: LisztHandle -> IO (Frame RawPointer)
-fetchRoot h = do
-  hSeek (hPayload h) SeekFromEnd (-fromIntegral footerSize)
-  fetchFrame' h footerSize
+fetchRoot h = fetchFrame'
+  (hSeek (hPayload h) SeekFromEnd (-fromIntegral footerSize)) h footerSize
 
 allocKey :: Key -> Transaction KeyPointer
 allocKey key = do
@@ -293,8 +293,9 @@ addFrame f = state $ \ts -> (Uncommited (freshId ts), ts
   { freshId = freshId ts + 1
   , pending = Map.insert (freshId ts) f (pending ts) })
 
-fetchFrame' :: LisztHandle -> Int -> IO (Frame RawPointer)
-fetchFrame' h len = modifyMVar (refBuffer h) $ \(blen, buf) -> do
+fetchFrame' :: IO () -> LisztHandle -> Int -> IO (Frame RawPointer)
+fetchFrame' seek h len = modifyMVar (refBuffer h) $ \(blen, buf) -> do
+  seek
   (blen', buf') <- if blen < len
     then do
       buf' <- B.mallocByteString len
@@ -307,9 +308,8 @@ fetchFrame' h len = modifyMVar (refBuffer h) $ \(blen, buf) -> do
   return ((blen', buf'), f)
 
 fetchFrame :: LisztHandle -> RawPointer -> IO (Frame RawPointer)
-fetchFrame h (RP ofs len) = do
-  hSeek (hPayload h) AbsoluteSeek (fromIntegral ofs)
-  fetchFrame' h len
+fetchFrame h (RP ofs len) = fetchFrame'
+  (hSeek (hPayload h) AbsoluteSeek (fromIntegral ofs)) h len
 
 fetchStage :: Pointer -> Transaction (Frame Pointer)
 fetchStage (Commited p) = do
