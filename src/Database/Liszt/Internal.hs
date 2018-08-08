@@ -51,6 +51,7 @@ import Data.Word
 import Data.Winery
 import qualified Data.Winery.Internal.Builder as WB
 import Foreign.ForeignPtr
+import Foreign.Ptr
 import GHC.Generics (Generic)
 import System.Directory
 import System.IO
@@ -81,12 +82,26 @@ data Frame a = Empty
 
 instance Serialise a => Serialise (Frame a)
 
-forceSpine :: NFData a => Frame a -> ()
-forceSpine (Leaf1 _ s) = rnf s
-forceSpine (Leaf2 _ s _ t) = rnf s `seq` rnf t
-forceSpine (Node2 _ _ s _) = rnf s
-forceSpine (Node3 _ _ s _ _ t _) = rnf s `seq` rnf t
-forceSpine _ = ()
+copyByteString :: B.ByteString -> IO B.ByteString
+copyByteString (B.PS fp ofs len) = do
+  fp' <- B.mallocByteString len
+  withForeignPtr fp' $ \dst -> withForeignPtr fp
+    $ \src -> B.memcpy dst (src `plusPtr` ofs) len
+  return (B.PS fp' 0 len)
+
+forceSpine :: NFData a => Frame a -> IO (Frame a)
+forceSpine f = case f of
+  Empty -> return Empty
+  Leaf1 _ s -> rnf s `seq` return f
+  Leaf2 _ s _ t -> rnf s `seq` rnf t `seq` return f
+  Node2 _ _ s _ -> rnf s  `seq` return f
+  Node3 _ _ s _ _ t _ -> rnf s `seq` rnf t `seq` return f
+  Tree tag p l r -> do
+    tag' <- WB.bytes <$> copyByteString (WB.toByteString tag)
+    return (Tree tag' p l r)
+  Leaf tag p -> do
+    tag' <- WB.bytes <$> copyByteString (WB.toByteString tag)
+    return (Leaf tag' p)
 
 data LisztHandle = LisztHandle
   { hPayload :: !Handle
@@ -119,6 +134,7 @@ data TransactionState = TS
   , freshId :: !Int
   , pending :: !(Map.Map Int (Frame Pointer))
   , currentRoot :: !(Frame Pointer)
+  , currentPos :: !Int
   , isModified :: !Bool
   }
 
@@ -134,10 +150,12 @@ clear key = do
 insert :: Key -> Tag -> Encoding -> Transaction ()
 insert key tag payload = do
   LisztHandle h _ _ _ <- gets dbHandle
-  liftIO $ hSeek h SeekFromEnd 0
-  ofs <- liftIO $ fromIntegral <$> hTell h
-  liftIO $ WB.hPut h payload
+  ofs <- gets currentPos
+  liftIO $ do
+    hSeek h SeekFromEnd 0
+    WB.hPut h payload
   root <- gets currentRoot
+  modify $ \ts -> ts { currentPos = ofs + WB.getSize payload }
   insertF key (insertSpine tag (ofs `RP` WB.getSize payload)) root >>= \case
     Pure t -> modify $ \ts -> ts { currentRoot = t, isModified = True }
     Carry l k a r -> modify $ \ts -> ts { currentRoot = Node2 l k a r, isModified = True }
@@ -159,12 +177,13 @@ fetchRoot h = do
 allocKey :: Key -> Transaction KeyPointer
 allocKey key = do
   LisztHandle h _ cache _ <- gets dbHandle
-  ofs <- liftIO $ do
+  ofs <- gets currentPos
+  liftIO $ do
     hSeek h SeekFromEnd 0
-    ofs <- fromIntegral <$> hTell h
     B.hPutStr h key
     modifyIORef' cache (IM.insert ofs key)
     return ofs
+  modify $ \ts -> ts { currentPos = ofs + B.length key }
   return $ KeyPointer $ RP ofs (B.length key)
 
 fetchKey :: LisztHandle -> KeyPointer -> IO Key
@@ -183,8 +202,10 @@ fetchKeyT p = gets dbHandle >>= \h -> liftIO (fetchKey h p)
 
 commit :: MonadIO m => LisztHandle -> Transaction a -> m a
 commit h transaction = liftIO $ modifyMVar (handleLock h) $ const $ do
+  offset0 <- fromIntegral <$> hFileSize h'
   root <- fmap Commited <$> fetchRoot h
-  (a, TS _ _ pendings root' modified) <- runStateT transaction $ TS h 0 Map.empty root False
+  (a, TS _ _ pendings root' offset1 modified) <- runStateT transaction
+    $ TS h 0 Map.empty root offset0 False
 
   let substP (Commited ofs) = return ofs
       substP (Uncommited i) = case Map.lookup i pendings of
@@ -218,8 +239,7 @@ commit h transaction = liftIO $ modifyMVar (handleLock h) $ const $ do
 
   when modified $ do
     hSeek h' SeekFromEnd 0
-    offset0 <- fromIntegral <$> hTell h'
-    RP _ len <- evalStateT (substF root') offset0
+    RP _ len <- evalStateT (substF root') offset1
     B.hPutStr h' $ B.drop len emptyFooter
     hFlush h'
   return ((), a)
@@ -283,7 +303,7 @@ fetchFrame' h len = modifyMVar (refBuffer h) $ \(blen, buf) -> do
   f <- withForeignPtr buf' $ \ptr -> do
     hGetBuf (hPayload h) ptr len
     let f = decodeFrame $ B.PS buf' 0 len
-    forceSpine f `seq` return f
+    forceSpine f
   return ((blen', buf'), f)
 
 fetchFrame :: LisztHandle -> RawPointer -> IO (Frame RawPointer)
@@ -437,6 +457,7 @@ type QueryResult = (Tag, RawPointer)
 
 dropSpine :: LisztHandle -> Int -> Spine RawPointer -> IO (Spine RawPointer)
 dropSpine _ _ [] = return []
+dropSpine _ 0 s = return s
 dropSpine h n0 ((siz0, t0) : xs0)
   | siz0 <= n0 = dropSpine h (n0 - siz0) xs0
   | otherwise = dropTree n0 siz0 t0 xs0
@@ -446,7 +467,7 @@ dropSpine h n0 ((siz0, t0) : xs0)
     dropTree n siz t xs = fetchFrame h t >>= \case
       Tree _ _ l r
         | n == 1 -> return $ (siz', l) : (siz', r) : xs
-        | n < siz' -> dropTree (n - 1) siz' l ((siz', r) : xs)
+        | n <= siz' -> dropTree (n - 1) siz' l ((siz', r) : xs)
         | otherwise -> dropTree (n - siz' - 1) siz' r xs
       Leaf _ _ -> return xs
       f -> error $ "dropTree: unexpected frame: " ++ show f
@@ -520,7 +541,7 @@ dropSpineWhile cond h = go 0 where
       | cond tag -> go (total + siz0 + siz) xs
       | otherwise -> dropTree total t0 ts
     Tree tag _ l r
-      | cond tag -> go (total + 1) $ (siz', l) : (siz', r) : xs
+      | cond tag -> go (total + siz0 + 1) $ (siz', l) : (siz', r) : xs
       | otherwise -> dropTree total t0 ts
     _ -> error "unexpected frame"
     where

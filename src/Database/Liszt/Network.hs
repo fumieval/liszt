@@ -23,6 +23,7 @@ import qualified Network.Socket.SendFile.Handle as SF
 import qualified Network.Socket.ByteString as SB
 import qualified Network.Socket as S
 import System.IO
+import Text.Read (readMaybe)
 
 respond :: LisztReader -> S.Socket -> IO ()
 respond env conn = do
@@ -32,7 +33,7 @@ respond env conn = do
     Right a -> return a
   unless (B.null msg) $ handleRequest env req $ \lh lastSeqNo offsets -> do
     let count = length offsets
-    SB.sendAll conn $ encodeResp $ Right count
+    SB.send conn $ encodeResp $ Right count
     forM_ (zip [lastSeqNo - count + 1..] offsets) $ \(i, (tag, RP pos len)) -> do
       SB.sendAll conn $ WB.toByteString $ mconcat
         [ WB.word64 (fromIntegral i)
@@ -63,7 +64,7 @@ startServer port path = withLisztReader path $ \env -> do
 encodeResp :: Either String Int -> B.ByteString
 encodeResp = BL.toStrict . encode
 
-newtype Connection = Connection S.Socket
+newtype Connection = Connection (MVar S.Socket)
 
 withConnection :: String -> Int -> (Connection -> IO r) -> IO r
 withConnection host port = bracket (connect host port) disconnect
@@ -74,20 +75,22 @@ connect host port = do
   addr:_ <- S.getAddrInfo (Just hints) (Just host) (Just $ show port)
   sock <- S.socket (S.addrFamily addr) (S.addrSocketType addr) (S.addrProtocol addr)
   S.connect sock $ S.addrAddress addr
-  return $ Connection sock
+  Connection <$> newMVar sock
 
 disconnect :: Connection -> IO ()
-disconnect (Connection sock) = S.close sock
+disconnect (Connection sock) = takeMVar sock >>= S.close
 
 fetch :: Connection -> Request -> IO [(Int, B.ByteString, B.ByteString)]
-fetch (Connection sock) req = do
+fetch (Connection msock) req = modifyMVar msock $ \sock -> do
   SB.sendAll sock $ serialiseOnly req
-  go $ runGetIncremental $ get >>= \case
-    Left e -> throw (read e :: LisztError)
+  go sock $ runGetIncremental $ get >>= \case
+    Left e -> case readMaybe e of
+      Just e' -> throw (e' :: LisztError)
+      Nothing -> fail $ "Unknown error: " ++ show e
     Right n -> replicateM n ((,,) <$> get <*> get <*> get)
   where
-    go (Done _ _ a) = return a
-    go (Partial cont) = do
+    go sock (Done _ _ a) = return (sock, a)
+    go sock (Partial cont) = do
       bs <- SB.recv sock 4096
-      if B.null bs then go $ cont Nothing else go $ cont $ Just bs
-    go (Fail _ _ str) = fail $ show req ++ ": " ++ str
+      if B.null bs then go sock $ cont Nothing else go sock $ cont $ Just bs
+    go _ (Fail _ _ str) = fail $ show req ++ ": " ++ str

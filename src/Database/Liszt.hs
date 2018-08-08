@@ -196,12 +196,12 @@ handleRequest lr@LisztReader{..} req@Request{..} cont = do
           dropSpineWhile ((>=p) . dec . WB.toByteString) streamHandle spine >>= \case
             Nothing -> cont streamHandle 0 []
             Just (dropped, e, spine') -> case reqFrom of
-              Count n -> takeSpine streamHandle n spine' [e] >>= cont streamHandle dropped
-              FromEnd n -> takeSpine streamHandle (n - dropped + 1) spine' [e] >>= cont streamHandle dropped
-              SeqNo n -> takeSpine streamHandle (len - n - dropped + 1) spine' [e] >>= cont streamHandle dropped
+              Count n -> takeSpine streamHandle n spine' [e] >>= cont streamHandle (len - dropped)
+              FromEnd n -> takeSpine streamHandle (n - dropped + 1) spine' [e] >>= cont streamHandle (len - dropped)
+              SeqNo n -> takeSpine streamHandle (len - dropped - n + 1) spine' [e] >>= cont streamHandle (len - dropped)
               WineryTag sch' name' q -> do
                 dec' <- handleWinery sch' name'
-                takeSpineWhile ((>=q) . dec' . WB.toByteString) streamHandle spine' [e] >>= cont streamHandle dropped
+                takeSpineWhile ((>=q) . dec' . WB.toByteString) streamHandle spine' [e] >>= cont streamHandle (len - dropped)
   where
     handleWinery :: Schema -> Text -> IO (B.ByteString -> Scientific)
     handleWinery sch name = either (throwIO . WinerySchemaError . show) pure
