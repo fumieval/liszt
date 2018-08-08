@@ -19,13 +19,13 @@ parseHostPort str k = case break (==':') str of
 data Options = Options
   { host :: String
   , timeout :: Double
-  , ranges :: [(Int, Int)]
-  , beginning :: Maybe Int
+  , ranges :: [(Offset, Offset)]
+  , beginning :: Maybe Offset
   }
 
-readOffset :: String -> Int
-readOffset ('_' : n) = -read n
-readOffset n = read n
+readOffset :: String -> Offset
+readOffset ('_' : n) = FromEnd (read n)
+readOffset n = SeqNo (read n)
 
 options :: [OptDescr (Options -> Options)]
 options = [Option "h" ["host"] (ReqArg (\str o -> o { host = str }) "HOST:PORT") "stream input"
@@ -45,10 +45,9 @@ defaultOptions = Options
   , beginning = Nothing
   }
 
-printBS :: (a, b, B.ByteString) -> IO ()
-printBS (_, _, bs) = do
-  print $ B.length bs
-  B.hPutStr stdout bs
+printBS :: (a, B.ByteString, B.ByteString) -> IO ()
+printBS (_, tag, _) = do
+  B.hPutStr stdout tag
   hFlush stdout
 
 main :: IO ()
@@ -58,15 +57,19 @@ main = getOpt Permute options <$> getArgs >>= \case
     parseHostPort (host o) withConnection $ \conn -> do
       let name' = B.pack name
       let timeout' = floor $ timeout o * 1000000
-      let req i j = Request (B.pack path) name' timeout' (SeqNo i) (SeqNo j)
+      let req i j = Request (B.pack path) name' timeout' i j
       forM_ (reverse $ ranges o) $ \(i, j) -> do
         bss <- fetch conn $ req i j
         mapM_ printBS bss
-      forM_ (beginning o) $ \start -> flip fix start $ \self i -> do
-        print i
-        bss <- fetch conn $ req i i
-        mapM_ printBS bss
-        unless (null bss) $ self $ let (j, _, _) = last bss in j + 1
+      forM_ (beginning o) $ \start -> do
+        bss0 <- fetch conn $ req start start
+        mapM_ printBS bss0
+        unless (null bss0) $ do
+          let (start', _, _) = last bss0
+          flip fix (start' + 1) $ \self i -> do
+            bss <- fetch conn $ req (SeqNo i) (SeqNo i)
+            mapM_ printBS bss
+            unless (null bss) $ self $ let (j, _, _) = last bss in j + 1
 
   (_, _, es) -> do
     name <- getProgName

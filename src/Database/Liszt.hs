@@ -69,7 +69,7 @@ defRequest path k = Request
   , reqKey = k
   , reqTimeout = maxBound `div` 2
   , reqFrom = Count 1
-  , reqTo = SeqNo (-1)
+  , reqTo = FromEnd 1
   }
 
 type IndexMap = HM.HashMap B.ByteString
