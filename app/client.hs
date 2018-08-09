@@ -54,10 +54,10 @@ main :: IO ()
 main = getOpt Permute options <$> getArgs >>= \case
   (fs, path : name : _, []) -> do
     let o = foldl (flip id) defaultOptions fs
-    parseHostPort (host o) withConnection $ \conn -> do
+    parseHostPort (host o) withConnection (B.pack path) $ \conn -> do
       let name' = B.pack name
       let timeout' = floor $ timeout o * 1000000
-      let req i j = Request (B.pack path) name' timeout' i j
+      let req i j = Request name' timeout' i j
       forM_ (reverse $ ranges o) $ \(i, j) -> do
         bss <- fetch conn $ req i j
         mapM_ printBS bss

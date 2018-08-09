@@ -19,6 +19,9 @@ module Database.Liszt (
     IndexMap,
     LisztError(..),
     LisztReader,
+    Tracker,
+    acquireTracker,
+    releaseTracker,
     withLisztReader,
     handleRequest,
     ) where
@@ -55,41 +58,46 @@ data Offset = Count !Int
 instance Serialise Offset
 
 data Request = Request
-  { reqPath :: !B.ByteString
-  , reqKey :: !Key
+  { reqKey :: !Key
   , reqTimeout :: !Int
   , reqFrom :: !Offset
   , reqTo :: !Offset
   } deriving (Show, Generic)
 instance Serialise Request
 
-defRequest :: B.ByteString -> Key -> Request
-defRequest path k = Request
-  { reqPath = path
-  , reqKey = k
-  , reqTimeout = maxBound `div` 2
+defRequest :: Key -> Request
+defRequest k = Request
+  { reqKey = k
+  , reqTimeout = 0
   , reqFrom = Count 1
   , reqTo = FromEnd 1
   }
 
 type IndexMap = HM.HashMap B.ByteString
 
-data Stream = Stream
+data Tracker = Tracker
   { vRoot :: TVar (Frame RawPointer)
   , vUpdated :: TVar Bool
   , vPending :: TVar [STM (IO ())]
+  , vReaders :: TVar Int
   , followThread :: ThreadId
   , streamHandle :: LisztHandle
   }
 
-createStream :: WatchManager -> FilePath -> IO Stream
-createStream man path = do
+releaseTracker :: Tracker -> IO ()
+releaseTracker Tracker{..} = do
+  killThread followThread
+  closeLiszt streamHandle
+
+createTracker :: WatchManager -> FilePath -> IO Tracker
+createTracker man path = do
   exist <- doesFileExist path
   unless exist $ throwIO FileNotFound
   streamHandle <- openLiszt path
   vRoot <- newTVarIO Empty
   vPending <- newTVarIO []
   vUpdated <- newTVarIO True
+  vReaders <- newTVarIO 1
   stopWatch <- watchDir man (takeDirectory path) (\case
     Modified path' _ _ | path == path' -> True
     _ -> False)
@@ -129,11 +137,11 @@ createStream man path = do
       return $ sequence_ ms
     wait) $ const $ stopWatch >> closeLiszt streamHandle
 
-  return Stream{..}
+  return Tracker{..}
 
 data LisztError = MalformedRequest
   | InvalidRequest
-  | StreamNotFound
+  | TrackerNotFound
   | FileNotFound
   | IndexNotFound
   | WinerySchemaError !String
@@ -143,33 +151,38 @@ instance Exception LisztError
 
 data LisztReader = LisztReader
   { watchManager :: WatchManager
-  , vStreams :: TVar (HM.HashMap B.ByteString Stream)
+  , vTrackers :: TVar (HM.HashMap B.ByteString Tracker)
   , prefix :: FilePath
   }
 
 withLisztReader :: FilePath -> (LisztReader -> IO ()) -> IO ()
 withLisztReader prefix k = do
-  vStreams <- newTVarIO HM.empty
+  vTrackers <- newTVarIO HM.empty
   withManager $ \watchManager -> k LisztReader{..}
 
-handleRequest :: LisztReader
+acquireTracker :: LisztReader -> B.ByteString -> IO Tracker
+acquireTracker LisztReader{..} path = join $ atomically $ do
+  streams <- readTVar vTrackers
+  case HM.lookup path streams of
+    Just s -> do
+      modifyTVar' (vReaders s) (+1)
+      return (return s)
+    Nothing -> return $ do
+      s <- createTracker watchManager (prefix </> B.unpack path)
+      atomically $ modifyTVar vTrackers (HM.insert path s)
+      return s
+
+handleRequest :: Tracker
   -> Request
   -> (LisztHandle -> Int -> [QueryResult] -> IO ())
   -> IO ()
-handleRequest lr@LisztReader{..} req@Request{..} cont = do
-  streams <- atomically $ readTVar vStreams
-  Stream{..} <- case HM.lookup reqPath streams of
-    Just s -> return s
-    Nothing -> do
-      s <- createStream watchManager (prefix </> B.unpack reqPath)
-      atomically $ modifyTVar vStreams (HM.insert reqPath s)
-      return s
+handleRequest str@Tracker{..} req@Request{..} cont = do
   root <- atomically $ do
     b <- readTVar vUpdated
     when b retry
     readTVar vRoot
   lookupSpine streamHandle reqKey root >>= \case
-    Nothing -> throwIO StreamNotFound
+    Nothing -> throwIO TrackerNotFound
     Just spine -> do
       let len = spineLength spine
       let goSeqNo ofs
@@ -177,7 +190,7 @@ handleRequest lr@LisztReader{..} req@Request{..} cont = do
               delay <- newDelay reqTimeout
               atomically $ do
                 modifyTVar vPending $ (:) $ cont streamHandle 0 [] <$ waitDelay delay
-                  <|> pure (handleRequest lr req { reqTo = SeqNo ofs } cont)
+                  <|> pure (handleRequest str req { reqTo = SeqNo ofs } cont)
             | otherwise = do
               spine' <- dropSpine streamHandle (len - ofs - 1) spine
               case reqFrom of
