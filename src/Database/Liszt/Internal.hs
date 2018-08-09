@@ -1,4 +1,4 @@
-{-# LANGUAGE LambdaCase, DeriveFunctor, DeriveGeneric #-}
+{-# LANGUAGE LambdaCase, DeriveTraversable, DeriveGeneric #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE BangPatterns #-}
@@ -16,7 +16,11 @@ module Database.Liszt.Internal (
   , Transaction
   -- * Reading
   , availableKeys
+  -- * Caching
+  , FrameCache
+  , mkFrameCache
   -- * Internal
+  , Fetchable(..)
   , Frame(..)
   , forceSpine
   , fetchRoot
@@ -79,7 +83,7 @@ data Frame a = Empty
   | Node3 !a !KeyPointer !(Spine a) !a !KeyPointer !(Spine a) !a
   | Tree !Tag !RawPointer !a !a
   | Leaf !Tag !RawPointer
-  deriving (Generic, Show, Eq, Functor)
+  deriving (Generic, Show, Eq, Functor, Foldable, Traversable)
 
 instance Serialise a => Serialise (Frame a)
 
@@ -253,7 +257,7 @@ commit h transaction = liftIO $ modifyMVar (handleLock h) $ const $ do
       put $! ofs + WB.getSize e
       return $ RP ofs (WB.getSize e)
 
-lookupSpine :: LisztHandle -> Key -> Frame RawPointer -> IO (Maybe (Spine RawPointer))
+lookupSpine :: Fetchable a => LisztHandle -> Key -> Frame a -> IO (Maybe (Spine a))
 lookupSpine h k (Leaf1 p v) = do
   vp <- fetchKey h p
   if k == vp then return (Just v) else return Nothing
@@ -307,9 +311,27 @@ fetchFrame' seek h len = modifyMVar (refBuffer h) $ \(blen, buf) -> do
     forceSpine f
   return ((blen', buf'), f)
 
-fetchFrame :: LisztHandle -> RawPointer -> IO (Frame RawPointer)
-fetchFrame h (RP ofs len) = fetchFrame'
-  (hSeek (hPayload h) AbsoluteSeek (fromIntegral ofs)) h len
+class Fetchable a where
+  fetchFrame :: LisztHandle -> a -> IO (Frame a)
+
+instance Fetchable RawPointer where
+  fetchFrame h (RP ofs len) = fetchFrame'
+    (hSeek (hPayload h) AbsoluteSeek (fromIntegral ofs)) h len
+
+instance Fetchable FrameCache where
+  fetchFrame = flip runFrameCache
+
+newtype FrameCache = FrameCache { runFrameCache :: LisztHandle -> IO (Frame FrameCache) }
+
+mkFrameCache :: RawPointer -> IO FrameCache
+mkFrameCache rp = do
+  ref <- newIORef Nothing
+  return $ FrameCache $ \h -> readIORef ref >>= \case
+    Nothing -> do
+      f <- fetchFrame h rp >>= traverse mkFrameCache
+      writeIORef ref $ Just $! f
+      return f
+    Just f -> return f
 
 fetchStage :: Pointer -> Transaction (Frame Pointer)
 fetchStage (Commited p) = do
@@ -455,14 +477,13 @@ availableKeys _ _ = fail "availableKeys: unexpected frame"
 
 type QueryResult = (Tag, RawPointer)
 
-dropSpine :: LisztHandle -> Int -> Spine RawPointer -> IO (Spine RawPointer)
+dropSpine :: Fetchable a => LisztHandle -> Int -> Spine a -> IO (Spine a)
 dropSpine _ _ [] = return []
 dropSpine _ 0 s = return s
 dropSpine h n0 ((siz0, t0) : xs0)
   | siz0 <= n0 = dropSpine h (n0 - siz0) xs0
   | otherwise = dropTree n0 siz0 t0 xs0
   where
-    dropTree :: Int -> Int -> RawPointer -> Spine RawPointer -> IO (Spine RawPointer)
     dropTree 0 siz t xs = return $ (siz, t) : xs
     dropTree n siz t xs = fetchFrame h t >>= \case
       Tree _ _ l r
@@ -470,18 +491,18 @@ dropSpine h n0 ((siz0, t0) : xs0)
         | n <= siz' -> dropTree (n - 1) siz' l ((siz', r) : xs)
         | otherwise -> dropTree (n - siz' - 1) siz' r xs
       Leaf _ _ -> return xs
-      f -> error $ "dropTree: unexpected frame: " ++ show f
+      f -> error $ "dropTree: unexpected frame"
       where
         siz' = siz `div` 2
 
-takeSpine :: LisztHandle -> Int -> Spine RawPointer -> [QueryResult] -> IO [QueryResult]
+takeSpine :: Fetchable a => LisztHandle -> Int -> Spine a -> [QueryResult] -> IO [QueryResult]
 takeSpine _ n _ ps | n <= 0 = return ps
 takeSpine _ _ [] ps = return ps
 takeSpine h n ((siz, t) : xs) ps
   | n >= siz = takeAll h t ps >>= takeSpine h (n - siz) xs
   | otherwise = takeTree h n siz t ps
 
-takeTree :: LisztHandle -> Int -> Int -> RawPointer -> [QueryResult] -> IO [QueryResult]
+takeTree :: Fetchable a => LisztHandle -> Int -> Int -> a -> [QueryResult] -> IO [QueryResult]
 takeTree _ n _ _ ps | n <= 0 = return ps
 takeTree h n siz t ps = fetchFrame h t >>= \case
   Tree tag p l r
@@ -491,19 +512,20 @@ takeTree h n siz t ps = fetchFrame h t >>= \case
       ps' <- takeAll h l ((tag, p) : ps)
       takeTree h (n - siz' - 1) siz' r ps'
   Leaf tag p -> return $ (tag, p) : ps
-  f -> error $ "takeTree: unexpected frame " ++ show f
+  f -> error $ "takeTree: unexpected frame"
   where
     siz' = siz `div` 2
 
-takeAll :: LisztHandle -> RawPointer -> [QueryResult] -> IO [QueryResult]
+takeAll :: Fetchable a => LisztHandle -> a -> [QueryResult] -> IO [QueryResult]
 takeAll h t ps = fetchFrame h t >>= \case
   Tree tag p l r -> takeAll h l ((tag, p) : ps) >>= takeAll h r
   Leaf tag p -> return ((tag, p) : ps)
-  f -> error $ "takeAll: unexpected frame " ++ show f
+  f -> error $ "takeAll: unexpected frame"
 
-takeSpineWhile :: (Tag -> Bool)
+takeSpineWhile :: Fetchable a
+  => (Tag -> Bool)
   -> LisztHandle
-  -> Spine RawPointer
+  -> Spine a
   -> [QueryResult] -> IO [QueryResult]
 takeSpineWhile cond h = go where
   go (t0 : ((siz, t) : xs)) ps = fetchFrame h t >>= \case
@@ -514,7 +536,7 @@ takeSpineWhile cond h = go where
       | cond tag -> takeAll h (snd t0) ps
         >>= go ((siz', l) : (siz', r) : xs) . ((tag, p):)
       | otherwise -> inner t0 ps
-    _ -> error "unexpected frame"
+    _ -> error "takeSpineWhile: unexpected frame"
     where
       siz' = siz `div` 2
   go [t] ps = inner t ps
@@ -527,14 +549,15 @@ takeSpineWhile cond h = go where
     Tree tag p l r
       | cond tag -> go [(siz', l), (siz', r)] ((tag, p) : ps)
       | otherwise -> return ps
-    _ -> error "unexpected frame"
+    _ -> error "takeSpineWhile: unexpected frame"
     where
       siz' = siz `div` 2
 
-dropSpineWhile :: (Tag -> Bool)
+dropSpineWhile :: Fetchable a
+  => (Tag -> Bool)
   -> LisztHandle
-  -> Spine RawPointer
-  -> IO (Maybe (Int, QueryResult, Spine RawPointer))
+  -> Spine a
+  -> IO (Maybe (Int, QueryResult, Spine a))
 dropSpineWhile cond h = go 0 where
   go !total (t0@(siz0, _) : ts@((siz, t) : xs)) = fetchFrame h t >>= \case
     Leaf tag _
@@ -543,7 +566,7 @@ dropSpineWhile cond h = go 0 where
     Tree tag _ l r
       | cond tag -> go (total + siz0 + 1) $ (siz', l) : (siz', r) : xs
       | otherwise -> dropTree total t0 ts
-    _ -> error "unexpected frame"
+    _ -> error "dropSpineWhile: unexpected frame"
     where
       siz' = siz `div` 2
   go total (t : ts) = dropTree total t ts
@@ -556,6 +579,6 @@ dropSpineWhile cond h = go 0 where
     Tree tag p l r
       | cond tag -> go (total + 1) $ (siz', l) : (siz', r) : ts
       | otherwise -> return $ Just (total, (tag, p), (siz', l) : (siz', r) : ts)
-    _ -> error "unexpected frame"
+    _ -> error "dropSpineWhile: unexpected frame"
     where
       siz' = siz `div` 2

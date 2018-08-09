@@ -76,30 +76,27 @@ defRequest k = Request
 type IndexMap = HM.HashMap B.ByteString
 
 data Tracker = Tracker
-  { vRoot :: TVar (Frame RawPointer)
-  , vUpdated :: TVar Bool
-  , vPending :: TVar [STM (IO ())]
-  , vReaders :: TVar Int
-  , followThread :: ThreadId
-  , streamHandle :: LisztHandle
+  { vRoot :: !(TVar (Frame FrameCache))
+  , vUpdated :: !(TVar Bool)
+  , vPending :: !(TVar [STM (IO ())])
+  , vReaders :: !(TVar Int)
+  , followThread :: !ThreadId
+  , trackerPath :: !B.ByteString
+  , streamHandle :: !LisztHandle
   }
 
-releaseTracker :: Tracker -> IO ()
-releaseTracker Tracker{..} = do
-  killThread followThread
-  closeLiszt streamHandle
-
-createTracker :: WatchManager -> FilePath -> IO Tracker
-createTracker man path = do
-  exist <- doesFileExist path
+createTracker :: WatchManager -> FilePath -> B.ByteString -> IO Tracker
+createTracker man prefix trackerPath = do
+  let filePath = prefix </> B.unpack trackerPath
+  exist <- doesFileExist filePath
   unless exist $ throwIO FileNotFound
-  streamHandle <- openLiszt path
+  streamHandle <- openLiszt filePath
   vRoot <- newTVarIO Empty
   vPending <- newTVarIO []
   vUpdated <- newTVarIO True
   vReaders <- newTVarIO 1
-  stopWatch <- watchDir man (takeDirectory path) (\case
-    Modified path' _ _ | path == path' -> True
+  stopWatch <- watchDir man (takeDirectory filePath) (\case
+    Modified path' _ _ | filePath == path' -> True
     _ -> False)
     $ const $ void $ atomically $ writeTVar vUpdated True
 
@@ -128,7 +125,7 @@ createTracker man path = do
           else seekRoot n
 
   followThread <- forkFinally (forever $ do
-    newRoot <- seekRoot 0
+    newRoot <- seekRoot 0 >>= traverse mkFrameCache
     join $ atomically $ do
       writeTVar vRoot newRoot
       pending <- readTVar vPending
@@ -141,7 +138,7 @@ createTracker man path = do
 
 data LisztError = MalformedRequest
   | InvalidRequest
-  | TrackerNotFound
+  | StreamNotFound
   | FileNotFound
   | IndexNotFound
   | WinerySchemaError !String
@@ -168,9 +165,20 @@ acquireTracker LisztReader{..} path = join $ atomically $ do
       modifyTVar' (vReaders s) (+1)
       return (return s)
     Nothing -> return $ do
-      s <- createTracker watchManager (prefix </> B.unpack path)
+      s <- createTracker watchManager prefix path
       atomically $ modifyTVar vTrackers (HM.insert path s)
       return s
+
+releaseTracker :: LisztReader -> Tracker -> IO ()
+releaseTracker LisztReader{..} Tracker{..} = join $ atomically $ do
+  n <- readTVar vReaders
+  if n <= 1
+    then do
+      modifyTVar' vTrackers (HM.delete trackerPath)
+      return $ do
+        killThread followThread
+        closeLiszt streamHandle
+    else return () <$ writeTVar vReaders (n - 1)
 
 handleRequest :: Tracker
   -> Request
@@ -182,7 +190,7 @@ handleRequest str@Tracker{..} req@Request{..} cont = do
     when b retry
     readTVar vRoot
   lookupSpine streamHandle reqKey root >>= \case
-    Nothing -> throwIO TrackerNotFound
+    Nothing -> throwIO StreamNotFound
     Just spine -> do
       let len = spineLength spine
       let goSeqNo ofs
