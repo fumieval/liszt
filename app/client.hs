@@ -59,15 +59,15 @@ main = getOpt Permute options <$> getArgs >>= \case
       let timeout' = floor $ timeout o * 1000000
       let req i j = Request name' timeout' i j
       forM_ (reverse $ ranges o) $ \(i, j) -> do
-        bss <- fetch conn $ req i j
+        bss <- fetch conn $ req maxBound i j
         mapM_ printBS bss
       forM_ (beginning o) $ \start -> do
-        bss0 <- fetch conn $ req start start
+        bss0 <- fetch conn $ req maxBound start start
         mapM_ printBS bss0
         unless (null bss0) $ do
           let (start', _, _) = last bss0
           flip fix (start' + 1) $ \self i -> do
-            bss <- fetch conn $ req (SeqNo i) (SeqNo i)
+            bss <- fetch conn $ req 1 (SeqNo i) (SeqNo i)
             mapM_ printBS bss
             unless (null bss) $ self $ let (j, _, _) = last bss in j + 1
 

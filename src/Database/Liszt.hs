@@ -50,8 +50,7 @@ import System.IO
 commitFile :: FilePath -> Transaction a -> IO a
 commitFile path m = withLiszt path $ \h -> commit h m
 
-data Offset = Count !Int
-  | SeqNo !Int
+data Offset = SeqNo !Int
   | FromEnd !Int
   | WineryTag !Schema !Text !Scientific
   deriving (Show, Generic)
@@ -60,6 +59,7 @@ instance Serialise Offset
 data Request = Request
   { reqKey :: !Key
   , reqTimeout :: !Int
+  , reqLimit :: !Int
   , reqFrom :: !Offset
   , reqTo :: !Offset
   } deriving (Show, Generic)
@@ -69,8 +69,9 @@ defRequest :: Key -> Request
 defRequest k = Request
   { reqKey = k
   , reqTimeout = 0
-  , reqFrom = Count 1
+  , reqFrom = FromEnd 1
   , reqTo = FromEnd 1
+  , reqLimit = maxBound
   }
 
 type IndexMap = HM.HashMap B.ByteString
@@ -202,14 +203,12 @@ handleRequest str@Tracker{..} req@Request{..} cont = do
             | otherwise = do
               spine' <- dropSpine streamHandle (len - ofs - 1) spine
               case reqFrom of
-                Count n -> takeSpine streamHandle n spine' [] >>= cont streamHandle ofs
-                FromEnd n -> takeSpine streamHandle (ofs - (len - n) + 1) spine' [] >>= cont streamHandle ofs
-                SeqNo n -> takeSpine streamHandle (ofs - n + 1) spine' [] >>= cont streamHandle ofs
+                FromEnd n -> takeSpine streamHandle (min reqLimit $ ofs - (len - n) + 1) spine' [] >>= cont streamHandle ofs
+                SeqNo n -> takeSpine streamHandle (min reqLimit $ ofs - n + 1) spine' [] >>= cont streamHandle ofs
                 WineryTag sch name p -> do
                   dec <- handleWinery sch name
                   takeSpineWhile ((>=p) . dec . WB.toByteString) streamHandle spine' [] >>= cont streamHandle ofs
       case reqTo of
-        Count _ -> throwIO InvalidRequest
         FromEnd ofs -> goSeqNo (len - ofs)
         SeqNo ofs -> goSeqNo ofs
         WineryTag sch name p -> do
@@ -217,9 +216,8 @@ handleRequest str@Tracker{..} req@Request{..} cont = do
           dropSpineWhile ((>=p) . dec . WB.toByteString) streamHandle spine >>= \case
             Nothing -> cont streamHandle 0 []
             Just (dropped, e, spine') -> case reqFrom of
-              Count n -> takeSpine streamHandle n spine' [e] >>= cont streamHandle (len - dropped)
-              FromEnd n -> takeSpine streamHandle (n - dropped + 1) spine' [e] >>= cont streamHandle (len - dropped)
-              SeqNo n -> takeSpine streamHandle (len - dropped - n + 1) spine' [e] >>= cont streamHandle (len - dropped)
+              FromEnd n -> takeSpine streamHandle (min reqLimit $ n - dropped + 1) spine' [e] >>= cont streamHandle (len - dropped)
+              SeqNo n -> takeSpine streamHandle (min reqLimit $ len - dropped - n + 1) spine' [e] >>= cont streamHandle (len - dropped)
               WineryTag sch' name' q -> do
                 dec' <- handleWinery sch' name'
                 takeSpineWhile ((>=q) . dec' . WB.toByteString) streamHandle spine' [e] >>= cont streamHandle (len - dropped)
