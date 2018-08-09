@@ -52,9 +52,11 @@ startServer port prefix = withLisztReader prefix $ \env -> do
     forever $ do
       (conn, _) <- S.accept sock
       forkFinally (do
-        path <- SB.recv conn 4096
-        bracket (acquireTracker env path) releaseTracker
-            $ \t -> forever $ respond t conn)
+        path <- decode .  BL.fromStrict <$> SB.recv conn 4096
+        bracket (acquireTracker env path) (releaseTracker env)
+          $ \t -> do
+            SB.sendAll conn $ B.pack "READY"
+            forever $ respond t conn)
         $ \result -> do
           case result of
             Left ex -> case fromException ex of
@@ -77,7 +79,8 @@ connect host port path = do
   addr:_ <- S.getAddrInfo (Just hints) (Just host) (Just $ show port)
   sock <- S.socket (S.addrFamily addr) (S.addrSocketType addr) (S.addrProtocol addr)
   S.connect sock $ S.addrAddress addr
-  _ <- SB.send sock path
+  SB.sendAll sock $ BL.toStrict $ encode path
+  _ <- SB.recv sock 4096
   Connection <$> newMVar sock
 
 disconnect :: Connection -> IO ()
