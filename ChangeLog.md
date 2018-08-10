@@ -1,3 +1,3 @@
-# Changelog for itodenwa
+## 0.1
 
-## Unreleased changes
+Initial release

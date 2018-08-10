@@ -1,18 +1,18 @@
 name:                liszt
-version:             0.1.0.0
+version:             "0.1"
 github:              "fumieval/liszt"
 license:             BSD3
 author:              "Fumiaki Kinoshita"
 maintainer:          "fumiexcel@gmail.com"
-copyright:           "Copyright (c) 2017 Fumiaki Kinoshita"
+copyright:           "Copyright (c) 2018 Fumiaki Kinoshita"
 
 extra-source-files:
 - README.md
 - ChangeLog.md
 
 # Metadata used when publishing your package
-# synopsis:            Short description of your package
-# category:            Data
+synopsis:            Append only key-list database
+category:            Database
 
 # To avoid duplicated efforts in documentation and dealing with the
 # complications of embedding Haddock markup inside cabal files, it is
