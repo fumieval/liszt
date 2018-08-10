@@ -21,9 +21,11 @@ description:         Please see the README on GitHub at <https://github.com/fumi
 
 dependencies:
 - base >= 4.7 && < 5
+- deepseq
 - network
 - bytestring
 - directory
+- exceptions
 - filepath
 - fsnotify
 - sendfile
@@ -33,11 +35,17 @@ dependencies:
 - unordered-containers
 - stm
 - stm-delay
+- winery
+- reflection
+- text
+- scientific
 
 library:
   source-dirs: src
   exposed-modules:
     - Database.Liszt
+    - Database.Liszt.Tracker
+    - Database.Liszt.Internal
     - Database.Liszt.Network
 
 executables:

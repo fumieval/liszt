@@ -1,21 +1,31 @@
 # Liszt
 
-## start a server
+Liszt is an append-only key-list database.
+
+## Insertion
+
+For the sake of reliability, insertion is performed locally.
+
+```haskell
+commitFile :: FilePath -> Transaction a -> IO a
+insert :: Serialise a => Key -> a -> Transaction ()
+
+> commitFile "foo.liszt" $ insert "message" ("hello, world" :: Text)
+```
+
+## Query
+
+`lisztd` starts a server. The first argument is the root directory to find liszt
+files.
 
 ```
-lisztd .
+$ lisztd .
 ```
 
-## reading
-
-Read 0th to 9th elements
-
-```
-liszt test -r 0:9
-```
-
-Follow a stream
+You can use the command line utility to watch a stream. `-b 0` follows a stream
+from offset 0. `-f "%p\n"` prints payloads with newlines.
 
 ```
-liszt test -b _1
-``
+$ liszt foo.liszt message -b 0 -f "%p\n"
+hello, world
+```
