@@ -93,6 +93,7 @@ data LisztHandle = LisztHandle
   { hPayload :: !Handle
   , refBuffer :: MVar (Int, ForeignPtr Word8)
   , keyCache :: IORef (IM.IntMap Key)
+  , refModified :: IORef Bool
   , handleLock :: MVar ()
   }
 
@@ -105,10 +106,11 @@ openLiszt path = liftIO $ do
   refBuffer <- newMVar (4096, buf)
   keyCache <- newIORef IM.empty
   handleLock <- newMVar ()
+  refModified <- newIORef False
   return LisztHandle{..}
 
 closeLiszt :: MonadIO m => LisztHandle -> m ()
-closeLiszt (LisztHandle h _ _ _) = liftIO $ hClose h
+closeLiszt lh = liftIO $ hClose $ hPayload lh
 
 withLiszt :: (MonadIO m, MonadMask m) => FilePath -> (LisztHandle -> m a) -> m a
 withLiszt path = bracket (openLiszt path) closeLiszt
@@ -124,7 +126,6 @@ data TransactionState = TS
   , pending :: !(IM.IntMap (Frame StagePointer))
   , currentRoot :: !(Frame StagePointer)
   , currentPos :: !Int
-  , isModified :: !Bool
   }
 
 type Transaction = StateT TransactionState IO
@@ -134,21 +135,25 @@ clear :: Key -> Transaction ()
 clear key = do
   root <- gets currentRoot
   insertF key (const $ return []) root >>= \case
-    Pure t -> modify $ \ts -> ts { currentRoot = t, isModified = True }
-    Carry l k a r -> modify $ \ts -> ts { currentRoot = Node2 l k a r, isModified = True }
+    Pure t -> modify $ \ts -> ts { currentRoot = t }
+    Carry l k a r -> modify $ \ts -> ts { currentRoot = Node2 l k a r }
+
+append :: LisztHandle -> (Handle -> IO a) -> IO a
+append LisztHandle{..} cont = do
+  hSeek hPayload SeekFromEnd 0
+  writeIORef refModified True
+  cont hPayload
 
 insertRaw :: Key -> Tag -> Encoding -> Transaction ()
 insertRaw key tag payload = do
-  LisztHandle h _ _ _ <- gets dbHandle
+  lh <- gets dbHandle
   ofs <- gets currentPos
-  liftIO $ do
-    hSeek h SeekFromEnd 0
-    hPutEncoding h payload
+  liftIO $ append lh $ \h -> hPutEncoding h payload
   root <- gets currentRoot
   modify $ \ts -> ts { currentPos = ofs + WB.getSize payload }
   insertF key (insertSpine tag (ofs `RP` WB.getSize payload)) root >>= \case
-    Pure t -> modify $ \ts -> ts { currentRoot = t, isModified = True }
-    Carry l k a r -> modify $ \ts -> ts { currentRoot = Node2 l k a r, isModified = True }
+    Pure t -> modify $ \ts -> ts { currentRoot = t }
+    Carry l k a r -> modify $ \ts -> ts { currentRoot = Node2 l k a r }
 
 addFrame :: Frame StagePointer -> Transaction StagePointer
 addFrame f = state $ \ts -> (Uncommited (freshId ts), ts
@@ -157,12 +162,11 @@ addFrame f = state $ \ts -> (Uncommited (freshId ts), ts
 
 allocKey :: Key -> Transaction KeyPointer
 allocKey key = do
-  LisztHandle h _ cache _ <- gets dbHandle
+  lh <- gets dbHandle
   ofs <- gets currentPos
-  liftIO $ do
-    hSeek h SeekFromEnd 0
+  liftIO $ append lh $ \h -> do
     B.hPutStr h key
-    modifyIORef' cache (IM.insert ofs key)
+    modifyIORef' (keyCache lh) (IM.insert ofs key)
   modify $ \ts -> ts { currentPos = ofs + B.length key }
   return $ KeyPointer $ RP ofs (B.length key)
 
@@ -171,8 +175,8 @@ commit h transaction = liftIO $ modifyMVar (handleLock h) $ const $ do
   offset0 <- fromIntegral <$> hFileSize h'
   root <- fetchRoot h
   do
-    (a, TS _ _ pendings root' offset1 modified) <- runStateT transaction
-      $ TS h 0 IM.empty (fmap Commited root) offset0 False
+    (a, TS _ _ pendings root' offset1) <- runStateT transaction
+      $ TS h 0 IM.empty (fmap Commited root) offset0
 
     let substP (Commited ofs) = return ofs
         substP (Uncommited i) = case IM.lookup i pendings of
@@ -204,15 +208,18 @@ commit h transaction = liftIO $ modifyMVar (handleLock h) $ const $ do
           write (Tree t p l' r')
         substF (Leaf t p) = write (Leaf t p)
 
-    when modified $ writeFooter offset1 $ substF root'
+    writeFooter offset1 $ substF root'
     return ((), a)
     `onException` writeFooter offset0 (write root)
   where
     writeFooter ofs m = do
-      hSeek h' SeekFromEnd 0
-      RP _ len <- evalStateT m ofs
-      B.hPutStr h' $ B.drop len emptyFooter
-      hFlush h'
+      modified <- readIORef (refModified h)
+      when modified $ do
+        hSeek h' SeekFromEnd 0
+        RP _ len <- evalStateT m ofs
+        B.hPutStr h' $ B.drop len emptyFooter
+        hFlush h'
+        writeIORef (refModified h) False
 
     h' = hPayload h
     write :: Frame RawPointer -> StateT Int IO RawPointer
