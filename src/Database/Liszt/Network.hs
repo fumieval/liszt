@@ -36,7 +36,7 @@ respond tracker conn = do
     forM_ (zip [lastSeqNo - count + 1..] offsets) $ \(i, (tag, RP pos len)) -> do
       SB.sendAll conn $ WB.toByteString $ mconcat
         [ WB.word64 (fromIntegral i)
-        , WB.word64 (fromIntegral $ WB.getSize tag), tag
+        , WB.word64 (fromIntegral $ B.length tag), WB.bytes tag
         , WB.word64 $ fromIntegral len]
       SF.sendFile' conn (hPayload lh) (fromIntegral pos) (fromIntegral len)
 

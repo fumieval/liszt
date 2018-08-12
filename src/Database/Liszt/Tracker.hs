@@ -74,7 +74,7 @@ data LisztError = MalformedRequest
 instance Exception LisztError
 
 data Tracker = Tracker
-  { vRoot :: !(TVar (Frame CachePointer))
+  { vRoot :: !(TVar (Frame Tag CachePointer))
   , vUpdated :: !(TVar Bool)
   , vPending :: !(TVar [STM (IO ())])
   , vReaders :: !(TVar Int)
@@ -85,8 +85,8 @@ data Tracker = Tracker
   }
 
 data Cache = Cache
-  { primaryCache :: TVar (IM.IntMap (Frame CachePointer))
-  , secondaryCache :: TVar (IM.IntMap (Frame CachePointer))
+  { primaryCache :: TVar (IM.IntMap (Frame Tag CachePointer))
+  , secondaryCache :: TVar (IM.IntMap (Frame Tag CachePointer))
   }
 
 newtype CachePointer = CachePointer RawPointer
@@ -230,20 +230,20 @@ handleRequest str@Tracker{..} req@Request{..} cont = do
                 SeqNo n -> takeSpine streamHandle (min reqLimit $ ofs - n + 1) spine' [] >>= cont streamHandle ofs
                 WineryTag sch name p -> do
                   dec <- handleWinery sch name
-                  takeSpineWhile ((>=p) . dec . WB.toByteString) streamHandle spine' [] >>= cont streamHandle ofs
+                  takeSpineWhile ((>=p) . dec) streamHandle spine' [] >>= cont streamHandle ofs
       case reqTo of
         FromEnd ofs -> goSeqNo (len - ofs)
         SeqNo ofs -> goSeqNo ofs
         WineryTag sch name p -> do
           dec <- handleWinery sch name
-          dropSpineWhile ((>=p) . dec . WB.toByteString) streamHandle spine >>= \case
+          dropSpineWhile ((>=p) . dec) streamHandle spine >>= \case
             Nothing -> cont streamHandle 0 []
             Just (dropped, e, spine') -> case reqFrom of
               FromEnd n -> takeSpine streamHandle (min reqLimit $ n - dropped + 1) spine' [e] >>= cont streamHandle (len - dropped)
               SeqNo n -> takeSpine streamHandle (min reqLimit $ len - dropped - n + 1) spine' [e] >>= cont streamHandle (len - dropped)
               WineryTag sch' name' q -> do
                 dec' <- handleWinery sch' name'
-                takeSpineWhile ((>=q) . dec' . WB.toByteString) streamHandle spine' [e] >>= cont streamHandle (len - dropped)
+                takeSpineWhile ((>=q) . dec') streamHandle spine' [e] >>= cont streamHandle (len - dropped)
   where
     handleWinery :: Schema -> [Text] -> IO (B.ByteString -> Scientific)
     handleWinery sch names = either (throwIO . WinerySchemaError . show) pure

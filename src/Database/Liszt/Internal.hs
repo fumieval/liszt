@@ -47,6 +47,7 @@ import Control.Monad
 import Control.Monad.Catch
 import Control.Monad.IO.Class
 import Control.Monad.Trans.State.Strict
+import Data.Bifunctor
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Internal as B
 import qualified Data.IntMap.Strict as IM
@@ -65,7 +66,7 @@ type Key = B.ByteString
 
 -- | Tag is an extra value attached to a payload. This can be used to perform
 -- a binary search.
-type Tag = WB.Encoding
+type Tag = B.ByteString
 
 type Spine a = [(Int, a)]
 
@@ -76,20 +77,30 @@ instance Serialise RawPointer
 instance NFData RawPointer where
   rnf r = r `seq` ()
 
-data Frame a = Empty
+data Frame t a = Empty
   | Leaf1 !KeyPointer !(Spine a)
   | Leaf2 !KeyPointer !(Spine a) !KeyPointer !(Spine a)
   | Node2 !a !KeyPointer !(Spine a) !a
   | Node3 !a !KeyPointer !(Spine a) !a !KeyPointer !(Spine a) !a
-  | Tree !Tag !RawPointer !a !a
-  | Leaf !Tag !RawPointer
+  | Tree !t !RawPointer !a !a
+  | Leaf !t !RawPointer
   deriving (Generic, Show, Eq, Functor, Foldable, Traversable)
 
-instance Serialise a => Serialise (Frame a)
+instance Bifunctor Frame where
+  bimap f g = \case
+    Empty -> Empty
+    Leaf1 k s -> Leaf1 k (map (fmap g) s)
+    Leaf2 j s k t -> Leaf2 j (map (fmap g) s) k (map (fmap g) t)
+    Node2 l k s r -> Node2 (g l) k (map (fmap g) s) (g r)
+    Node3 l j s m k t r -> Node3 (g l) j (map (fmap g) s) (g m) k (map (fmap g) t) (g r)
+    Tree t p l r -> Tree (f t) p (g l) (g r)
+    Leaf t p -> Leaf (f t) p
 
-decodeFrame :: B.ByteString -> Frame RawPointer
+instance (Serialise t, Serialise a) => Serialise (Frame t a)
+
+decodeFrame :: B.ByteString -> Frame Tag RawPointer
 decodeFrame = either (error . show) id $ getDecoder
-  $ schema (Proxy :: Proxy (Frame RawPointer))
+  $ schema (Proxy :: Proxy (Frame Tag RawPointer))
 
 data LisztHandle = LisztHandle
   { hPayload :: !Handle
@@ -125,8 +136,8 @@ data StagePointer = Commited !RawPointer | Uncommited !Int deriving Eq
 data TransactionState = TS
   { dbHandle :: !LisztHandle
   , freshId :: !Int
-  , pending :: !(IM.IntMap (Frame StagePointer))
-  , currentRoot :: !(Frame StagePointer)
+  , pending :: !(IM.IntMap (Frame Encoding StagePointer))
+  , currentRoot :: !(Frame Encoding StagePointer)
   , currentPos :: !Int
   }
 
@@ -146,7 +157,7 @@ append LisztHandle{..} cont = do
   writeIORef refModified True
   cont hPayload
 
-insertRaw :: Key -> Tag -> Encoding -> Transaction ()
+insertRaw :: Key -> Encoding -> Encoding -> Transaction ()
 insertRaw key tag payload = do
   lh <- gets dbHandle
   ofs <- gets currentPos
@@ -157,7 +168,7 @@ insertRaw key tag payload = do
     Pure t -> modify $ \ts -> ts { currentRoot = t }
     Carry l k a r -> modify $ \ts -> ts { currentRoot = Node2 l k a r }
 
-addFrame :: Frame StagePointer -> Transaction StagePointer
+addFrame :: Frame Encoding StagePointer -> Transaction StagePointer
 addFrame f = state $ \ts -> (Uncommited (freshId ts), ts
   { freshId = freshId ts + 1
   , pending = IM.insert (freshId ts) f (pending ts) })
@@ -178,7 +189,7 @@ commit h transaction = liftIO $ modifyMVar (handleLock h) $ const $ do
   root <- fetchRoot h
   do
     (a, TS _ _ pendings root' offset1) <- runStateT transaction
-      $ TS h 0 IM.empty (fmap Commited root) offset0
+      $ TS h 0 IM.empty (bimap WB.bytes Commited root) offset0
 
     let substP (Commited ofs) = return ofs
         substP (Uncommited i) = case IM.lookup i pendings of
@@ -212,7 +223,7 @@ commit h transaction = liftIO $ modifyMVar (handleLock h) $ const $ do
 
     writeFooter offset1 $ substF root'
     return ((), a)
-    `onException` writeFooter offset0 (write root)
+    `onException` writeFooter offset0 (write $ first WB.bytes root)
   where
     writeFooter ofs m = do
       modified <- readIORef (refModified h)
@@ -224,7 +235,7 @@ commit h transaction = liftIO $ modifyMVar (handleLock h) $ const $ do
         writeIORef (refModified h) False
 
     h' = hPayload h
-    write :: Frame RawPointer -> StateT Int IO RawPointer
+    write :: Frame Encoding RawPointer -> StateT Int IO RawPointer
     write f = do
       ofs <- get
       let e = toEncoding f
@@ -235,15 +246,15 @@ commit h transaction = liftIO $ modifyMVar (handleLock h) $ const $ do
 fetchKeyT :: KeyPointer -> Transaction Key
 fetchKeyT p = gets dbHandle >>= \h -> liftIO (fetchKey h p)
 
-fetchStage :: StagePointer -> Transaction (Frame StagePointer)
+fetchStage :: StagePointer -> Transaction (Frame Encoding StagePointer)
 fetchStage (Commited p) = do
   h <- gets dbHandle
-  liftIO $ fmap Commited <$> fetchFrame h p
+  liftIO $ bimap WB.bytes Commited <$> fetchFrame h p
 fetchStage (Uncommited i) = gets pending >>= return . maybe (error "fetch: not found") id . IM.lookup i
 
 insertF :: Key
   -> (Spine StagePointer -> Transaction (Spine StagePointer))
-  -> Frame StagePointer
+  -> Frame Encoding StagePointer
   -> Transaction (Result StagePointer)
 insertF k u Empty = Pure <$> (Leaf1 <$> allocKey k <*> u [])
 insertF k u (Leaf1 pk pv) = do
@@ -351,10 +362,10 @@ insertF k u (Node3 l pk0 pv0 m qk0 qv0 r) = do
 insertF _ _ (Tree _ _ _ _) = fail "Unexpected Tree"
 insertF _ _ (Leaf _ _) = fail "Unexpected Leaf"
 
-data Result a = Pure (Frame a)
+data Result a = Pure (Frame Encoding a)
   | Carry !a !KeyPointer !(Spine a) !a
 
-insertSpine :: Tag -> RawPointer -> Spine StagePointer -> Transaction (Spine StagePointer)
+insertSpine :: Encoding -> RawPointer -> Spine StagePointer -> Transaction (Spine StagePointer)
 insertSpine tag p ((m, x) : (n, y) : ss) | m == n = do
   t <- addFrame $ Tree tag p x y
   return $ (2 * m + 1, t) : ss
@@ -366,7 +377,7 @@ insertSpine tag p ss = do
 -- Fetching
 
 class Fetchable a where
-  fetchFrame :: LisztHandle -> a -> IO (Frame a)
+  fetchFrame :: LisztHandle -> a -> IO (Frame Tag a)
 
 instance Fetchable RawPointer where
   fetchFrame h (RP ofs len) = fetchFrame'
@@ -383,7 +394,7 @@ fetchKey LisztHandle{..} (KeyPointer (RP ofs len)) = do
       modifyIORef' keyCache (IM.insert ofs key)
       return key
 
-fetchFrame' :: IO () -> LisztHandle -> Int -> IO (Frame RawPointer)
+fetchFrame' :: IO () -> LisztHandle -> Int -> IO (Frame Tag RawPointer)
 fetchFrame' seek h len = modifyMVar (refBuffer h) $ \(blen, buf) -> do
   seek
   (blen', buf') <- if blen < len
@@ -396,8 +407,9 @@ fetchFrame' seek h len = modifyMVar (refBuffer h) $ \(blen, buf) -> do
     let f = decodeFrame $ B.PS buf' 0 len
     forceSpine f
   return ((blen', buf'), f)
+{-# INLINE fetchFrame' #-}
 
-lookupSpine :: Fetchable a => LisztHandle -> Key -> Frame a -> IO (Maybe (Spine a))
+lookupSpine :: Fetchable a => LisztHandle -> Key -> Frame tag a -> IO (Maybe (Spine a))
 lookupSpine h k (Leaf1 p v) = do
   vp <- fetchKey h p
   if k == vp then return (Just v) else return Nothing
@@ -425,7 +437,7 @@ lookupSpine h k (Node3 l p u m q v r) = do
         GT -> fetchFrame h r >>= lookupSpine h k
 lookupSpine _ _ _ = return Nothing
 
-availableKeys :: LisztHandle -> Frame RawPointer -> IO [Key]
+availableKeys :: LisztHandle -> Frame t RawPointer -> IO [Key]
 availableKeys _ Empty = return []
 availableKeys h (Leaf1 k _) = pure <$> fetchKey h k
 availableKeys h (Leaf2 j _ k _) = sequence [fetchKey h j, fetchKey h k]
@@ -460,7 +472,7 @@ emptyFooter = B.pack  [0,14,171,160,140,150,185,18,22,70,203,145,129,232,42,76,8
 isFooter :: B.ByteString -> Bool
 isFooter bs = B.drop 128 bs == B.drop 128 emptyFooter
 
-fetchRoot :: LisztHandle -> IO (Frame RawPointer)
+fetchRoot :: LisztHandle -> IO (Frame Tag RawPointer)
 fetchRoot h = fetchFrame'
   (hSeek (hPayload h) SeekFromEnd (-fromIntegral footerSize)) h footerSize
 
@@ -588,7 +600,7 @@ copyByteString (B.PS fp ofs len) = do
     $ \src -> B.memcpy dst (src `plusPtr` ofs) len
   return (B.PS fp' 0 len)
 
-forceSpine :: NFData a => Frame a -> IO (Frame a)
+forceSpine :: NFData a => Frame Tag a -> IO (Frame Tag a)
 forceSpine f = case f of
   Empty -> return Empty
   Leaf1 _ s -> rnf s `seq` return f
@@ -596,8 +608,8 @@ forceSpine f = case f of
   Node2 _ _ s _ -> rnf s  `seq` return f
   Node3 _ _ s _ _ t _ -> rnf s `seq` rnf t `seq` return f
   Tree tag p l r -> do
-    tag' <- WB.bytes <$> copyByteString (WB.toByteString tag)
+    tag' <- copyByteString tag
     return (Tree tag' p l r)
   Leaf tag p -> do
-    tag' <- WB.bytes <$> copyByteString (WB.toByteString tag)
+    tag' <- copyByteString tag
     return (Leaf tag' p)
