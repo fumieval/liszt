@@ -24,6 +24,7 @@ module Database.Liszt.Internal (
   -- * Fetching
   , Fetchable(..)
   , RawPointer(..)
+  , fetchPayload
   -- * Footer
   , fetchRoot
   , footerSize
@@ -440,6 +441,11 @@ availableKeys h (Node3 l j _ m k _ r) = do
   rks <- fetchFrame h r >>= availableKeys h
   return $ lks ++ vj : mks ++ vk : rks
 availableKeys _ _ = fail "availableKeys: unexpected frame"
+
+fetchPayload :: LisztHandle -> RawPointer -> IO B.ByteString
+fetchPayload LisztHandle{..} (RP ofs len) = do
+  hSeek hPayload AbsoluteSeek (fromIntegral ofs)
+  B.hGet hPayload len
 
 --------------------------------------------------------------------------------
 -- Footer (root node)
