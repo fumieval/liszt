@@ -8,8 +8,10 @@ module Database.Liszt.Network
   , fetch) where
 
 import Control.Concurrent
-import Control.Exception
+import Control.Exception (evaluate, throw, throwIO)
 import Control.Monad
+import Control.Monad.Catch
+import Control.Monad.IO.Class
 import Database.Liszt.Tracker
 import Database.Liszt.Internal (hPayload, RawPointer(..))
 import Data.Binary
@@ -69,11 +71,11 @@ encodeResp = BL.toStrict . encode
 
 newtype Connection = Connection (MVar S.Socket)
 
-withConnection :: String -> Int -> B.ByteString -> (Connection -> IO r) -> IO r
+withConnection :: (MonadIO m, MonadMask m) => String -> Int -> B.ByteString -> (Connection -> m r) -> m r
 withConnection host port path = bracket (connect host port path) disconnect
 
-connect :: String -> Int -> B.ByteString -> IO Connection
-connect host port path = do
+connect :: MonadIO m => String -> Int -> B.ByteString -> m Connection
+connect host port path = liftIO $ do
   let hints = S.defaultHints { S.addrFlags = [S.AI_NUMERICSERV], S.addrSocketType = S.Stream }
   addr:_ <- S.getAddrInfo (Just hints) (Just host) (Just $ show port)
   sock <- S.socket (S.addrFamily addr) (S.addrSocketType addr) (S.addrProtocol addr)
@@ -82,11 +84,11 @@ connect host port path = do
   _ <- SB.recv sock 4096
   Connection <$> newMVar sock
 
-disconnect :: Connection -> IO ()
-disconnect (Connection sock) = takeMVar sock >>= S.close
+disconnect :: MonadIO m => Connection -> m ()
+disconnect (Connection sock) = liftIO $ takeMVar sock >>= S.close
 
-fetch :: Connection -> Request -> IO [(Int, B.ByteString, B.ByteString)]
-fetch (Connection msock) req = modifyMVar msock $ \sock -> do
+fetch :: MonadIO m => Connection -> Request -> m [(Int, B.ByteString, B.ByteString)]
+fetch (Connection msock) req = liftIO $ modifyMVar msock $ \sock -> do
   SB.sendAll sock $ serialiseOnly req
   go sock $ runGetIncremental $ get >>= \case
     Left e -> case readMaybe e of
