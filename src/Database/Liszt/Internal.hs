@@ -34,6 +34,7 @@ module Database.Liszt.Internal (
   , Spine
   , spineLength
   , QueryResult
+  , takeAll
   , takeSpine
   , dropSpine
   , takeSpineWhile
