@@ -34,7 +34,7 @@ module Database.Liszt.Internal (
   , Spine
   , spineLength
   , QueryResult
-  , takeAll
+  , wholeSpine
   , takeSpine
   , dropSpine
   , takeSpineWhile
@@ -522,6 +522,10 @@ takeTree h n siz t ps = fetchFrame h t >>= \case
   _ -> error $ "takeTree: unexpected frame"
   where
     siz' = siz `div` 2
+
+wholeSpine :: Fetchable a => LisztHandle -> Spine a -> [QueryResult] -> IO [QueryResult]
+wholeSpine h ((_, s) : ss) r = wholeSpine h ss r >>= takeAll h s
+wholeSpine _ [] r = return r
 
 takeAll :: Fetchable a => LisztHandle -> a -> [QueryResult] -> IO [QueryResult]
 takeAll h t ps = fetchFrame h t >>= \case
