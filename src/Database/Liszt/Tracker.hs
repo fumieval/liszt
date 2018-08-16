@@ -79,7 +79,7 @@ data Tracker = Tracker
   , vPending :: !(TVar [STM (IO ())])
   , vReaders :: !(TVar Int)
   , followThread :: !ThreadId
-  , trackerPath :: !B.ByteString
+  , filePath :: !FilePath
   , streamHandle :: !LisztHandle
   , cache :: !Cache
   }
@@ -113,9 +113,8 @@ flipCache Cache{..} = do
   readTVar primaryCache >>= writeTVar secondaryCache
   writeTVar primaryCache IM.empty
 
-createTracker :: WatchManager -> FilePath -> B.ByteString -> IO Tracker
-createTracker man prefix trackerPath = do
-  let filePath = prefix </> B.unpack trackerPath
+createTracker :: WatchManager -> FilePath -> IO Tracker
+createTracker man filePath = do
   exist <- doesFileExist filePath
   unless exist $ throwIO FileNotFound
   streamHandle <- openLiszt filePath
@@ -169,7 +168,7 @@ createTracker man prefix trackerPath = do
 
 data LisztReader = LisztReader
   { watchManager :: WatchManager
-  , vTrackers :: TVar (HM.HashMap B.ByteString Tracker)
+  , vTrackers :: TVar (HM.HashMap FilePath Tracker)
   , prefix :: FilePath
   }
 
@@ -178,7 +177,7 @@ withLisztReader prefix k = do
   vTrackers <- newTVarIO HM.empty
   withManager $ \watchManager -> k LisztReader{..}
 
-acquireTracker :: LisztReader -> B.ByteString -> IO Tracker
+acquireTracker :: LisztReader -> FilePath -> IO Tracker
 acquireTracker LisztReader{..} path = join $ atomically $ do
   streams <- readTVar vTrackers
   case HM.lookup path streams of
@@ -186,7 +185,7 @@ acquireTracker LisztReader{..} path = join $ atomically $ do
       modifyTVar' (vReaders s) (+1)
       return (return s)
     Nothing -> return $ do
-      s <- createTracker watchManager prefix path
+      s <- createTracker watchManager path
       atomically $ modifyTVar vTrackers (HM.insert path s)
       return s
 
@@ -195,13 +194,13 @@ releaseTracker LisztReader{..} Tracker{..} = join $ atomically $ do
   n <- readTVar vReaders
   if n <= 1
     then do
-      modifyTVar' vTrackers (HM.delete trackerPath)
+      modifyTVar' vTrackers (HM.delete filePath)
       return $ do
         killThread followThread
         closeLiszt streamHandle
     else return () <$ writeTVar vReaders (n - 1)
 
-withTracker :: LisztReader -> B.ByteString -> (Tracker -> IO a) -> IO a
+withTracker :: LisztReader -> FilePath -> (Tracker -> IO a) -> IO a
 withTracker env path = bracket (acquireTracker env path) (releaseTracker env)
 
 handleRequest :: Tracker
