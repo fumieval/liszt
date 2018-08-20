@@ -74,7 +74,7 @@ data LisztError = MalformedRequest
 instance Exception LisztError
 
 data Tracker = Tracker
-  { vRoot :: !(TVar (Frame Tag CachePointer))
+  { vRoot :: !(TVar (Node Tag CachePointer))
   , vUpdated :: !(TVar Bool)
   , vPending :: !(TVar [STM (IO ())])
   , vReaders :: !(TVar Int)
@@ -85,14 +85,14 @@ data Tracker = Tracker
   }
 
 data Cache = Cache
-  { primaryCache :: TVar (IM.IntMap (Frame Tag CachePointer))
-  , secondaryCache :: TVar (IM.IntMap (Frame Tag CachePointer))
+  { primaryCache :: TVar (IM.IntMap (Node Tag CachePointer))
+  , secondaryCache :: TVar (IM.IntMap (Node Tag CachePointer))
   }
 
 newtype CachePointer = CachePointer RawPointer
 
 instance Given Cache => Fetchable CachePointer where
-  fetchFrame h (CachePointer p@(RP ofs _)) = join $ atomically $ do
+  fetchNode h (CachePointer p@(RP ofs _)) = join $ atomically $ do
     let Cache{..} = given
     pcache <- readTVar primaryCache
     case IM.lookup ofs pcache of
@@ -104,7 +104,7 @@ instance Given Cache => Fetchable CachePointer where
             writeTVar primaryCache $! IM.insert ofs x pcache
             return (pure x)
           Nothing -> return $ do
-            x <- fmap CachePointer <$> fetchFrame h p
+            x <- fmap CachePointer <$> fetchNode h p
             atomically $ modifyTVar' primaryCache $ IM.insert ofs x
             return x
 
@@ -141,7 +141,7 @@ createTracker man filePath = do
           then do
             let bs = B.PS fptr (max 0 $ prevSize - footerSize) footerSize
             if isFooter bs
-              then try (evaluate $ decodeFrame bs) >>= \case
+              then try (evaluate $ decodeNode bs) >>= \case
                 Left (_ :: DecodeException) -> do
                   wait
                   seekRoot 0

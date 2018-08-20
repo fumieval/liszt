@@ -17,9 +17,9 @@ module Database.Liszt.Internal (
   , TransactionState
   -- * Reading
   , availableKeys
-  -- * Frame
-  , Frame(..)
-  , decodeFrame
+  -- * Node
+  , Node(..)
+  , decodeNode
   , forceSpine
   -- * Fetching
   , Fetchable(..)
@@ -77,7 +77,7 @@ instance Serialise RawPointer
 instance NFData RawPointer where
   rnf r = r `seq` ()
 
-data Frame t a = Empty
+data Node t a = Empty
   | Leaf1 !KeyPointer !(Spine a)
   | Leaf2 !KeyPointer !(Spine a) !KeyPointer !(Spine a)
   | Node2 !a !KeyPointer !(Spine a) !a
@@ -86,7 +86,7 @@ data Frame t a = Empty
   | Leaf !t !RawPointer
   deriving (Generic, Show, Eq, Functor, Foldable, Traversable)
 
-instance Bifunctor Frame where
+instance Bifunctor Node where
   bimap f g = \case
     Empty -> Empty
     Leaf1 k s -> Leaf1 k (map (fmap g) s)
@@ -96,11 +96,11 @@ instance Bifunctor Frame where
     Tree t p l r -> Tree (f t) p (g l) (g r)
     Leaf t p -> Leaf (f t) p
 
-instance (Serialise t, Serialise a) => Serialise (Frame t a)
+instance (Serialise t, Serialise a) => Serialise (Node t a)
 
-decodeFrame :: B.ByteString -> Frame Tag RawPointer
-decodeFrame = either (error . show) id $ getDecoder
-  $ schema (Proxy :: Proxy (Frame Tag RawPointer))
+decodeNode :: B.ByteString -> Node Tag RawPointer
+decodeNode = either (error . show) id $ getDecoder
+  $ schema (Proxy :: Proxy (Node Tag RawPointer))
 
 data LisztHandle = LisztHandle
   { hPayload :: !Handle
@@ -136,8 +136,8 @@ data StagePointer = Commited !RawPointer | Uncommited !Int deriving Eq
 data TransactionState = TS
   { dbHandle :: !LisztHandle
   , freshId :: !Int
-  , pending :: !(IM.IntMap (Frame Encoding StagePointer))
-  , currentRoot :: !(Frame Encoding StagePointer)
+  , pending :: !(IM.IntMap (Node Encoding StagePointer))
+  , currentRoot :: !(Node Encoding StagePointer)
   , currentPos :: !Int
   }
 
@@ -168,8 +168,8 @@ insertRaw key tag payload = do
     Pure t -> modify $ \ts -> ts { currentRoot = t }
     Carry l k a r -> modify $ \ts -> ts { currentRoot = Node2 l k a r }
 
-addFrame :: Frame Encoding StagePointer -> Transaction StagePointer
-addFrame f = state $ \ts -> (Uncommited (freshId ts), ts
+addNode :: Node Encoding StagePointer -> Transaction StagePointer
+addNode f = state $ \ts -> (Uncommited (freshId ts), ts
   { freshId = freshId ts + 1
   , pending = IM.insert (freshId ts) f (pending ts) })
 
@@ -235,7 +235,7 @@ commit h transaction = liftIO $ modifyMVar (handleLock h) $ const $ do
         writeIORef (refModified h) False
 
     h' = hPayload h
-    write :: Frame Encoding RawPointer -> StateT Int IO RawPointer
+    write :: Node Encoding RawPointer -> StateT Int IO RawPointer
     write f = do
       ofs <- get
       let e = toEncoding f
@@ -246,15 +246,15 @@ commit h transaction = liftIO $ modifyMVar (handleLock h) $ const $ do
 fetchKeyT :: KeyPointer -> Transaction Key
 fetchKeyT p = gets dbHandle >>= \h -> liftIO (fetchKey h p)
 
-fetchStage :: StagePointer -> Transaction (Frame Encoding StagePointer)
+fetchStage :: StagePointer -> Transaction (Node Encoding StagePointer)
 fetchStage (Commited p) = do
   h <- gets dbHandle
-  liftIO $ bimap WB.bytes Commited <$> fetchFrame h p
+  liftIO $ bimap WB.bytes Commited <$> fetchNode h p
 fetchStage (Uncommited i) = gets pending >>= return . maybe (error "fetch: not found") id . IM.lookup i
 
 insertF :: Key
   -> (Spine StagePointer -> Transaction (Spine StagePointer))
-  -> Frame Encoding StagePointer
+  -> Node Encoding StagePointer
   -> Transaction (Result StagePointer)
 insertF k u Empty = Pure <$> (Leaf1 <$> allocKey k <*> u [])
 insertF k u (Leaf1 pk pv) = do
@@ -273,8 +273,8 @@ insertF k u (Leaf2 pk pv qk qv) = do
     LT -> do
       v <- u []
       kp <- allocKey k
-      l <- addFrame $ Leaf1 kp v
-      r <- addFrame $ Leaf1 qk qv
+      l <- addNode $ Leaf1 kp v
+      r <- addNode $ Leaf1 qk qv
       return $ Carry l pk pv r
     EQ -> do
       v <- u pv
@@ -284,8 +284,8 @@ insertF k u (Leaf2 pk pv qk qv) = do
       case compare k vqk of
         LT -> do
           v <- u []
-          l <- addFrame $ Leaf1 pk pv
-          r <- addFrame $ Leaf1 qk qv
+          l <- addNode $ Leaf1 pk pv
+          r <- addNode $ Leaf1 qk qv
           kp <- allocKey k
           return $ Carry l kp v r
         EQ -> do
@@ -294,8 +294,8 @@ insertF k u (Leaf2 pk pv qk qv) = do
         GT -> do
           v <- u []
           kp <- allocKey k
-          l <- addFrame $ Leaf1 pk pv
-          r <- addFrame $ Leaf1 kp v
+          l <- addNode $ Leaf1 pk pv
+          r <- addNode $ Leaf1 kp v
           return $ Carry l qk qv r
 insertF k u (Node2 l pk0 pv0 r) = do
   vpk0 <- fetchKeyT pk0
@@ -304,7 +304,7 @@ insertF k u (Node2 l pk0 pv0 r) = do
       fl <- fetchStage l
       insertF k u fl >>= \case
         Pure l' -> do
-          l'' <- addFrame l'
+          l'' <- addNode l'
           return $ Pure $ Node2 l'' pk0 pv0 r
         Carry l' ck cv r' -> return $ Pure $ Node3 l' ck cv r' pk0 pv0 r
     EQ -> do
@@ -314,7 +314,7 @@ insertF k u (Node2 l pk0 pv0 r) = do
       fr <- fetchStage r
       insertF k u fr >>= \case
         Pure r' -> do
-          r'' <- addFrame r'
+          r'' <- addNode r'
           return $ Pure $ Node2 l pk0 pv0 r''
         Carry l' ck cv r' -> return $ Pure $ Node3 l pk0 pv0 l' ck cv r'
 insertF k u (Node3 l pk0 pv0 m qk0 qv0 r) = do
@@ -324,11 +324,11 @@ insertF k u (Node3 l pk0 pv0 m qk0 qv0 r) = do
       fl <- fetchStage l
       insertF k u fl >>= \case
         Pure l' -> do
-          l'' <- addFrame l'
+          l'' <- addNode l'
           return $ Pure $ Node3 l'' pk0 pv0 m qk0 qv0 r
         Carry l' ck cv r' -> do
-          bl <- addFrame (Node2 l' ck cv r')
-          br <- addFrame (Node2 m qk0 qv0 r)
+          bl <- addNode (Node2 l' ck cv r')
+          br <- addNode (Node2 m qk0 qv0 r)
           return $ Pure $ Node2 bl pk0 pv0 br
     EQ -> do
       v <- u pv0
@@ -340,11 +340,11 @@ insertF k u (Node3 l pk0 pv0 m qk0 qv0 r) = do
           fm <- fetchStage m
           insertF k u fm >>= \case
             Pure m' -> do
-              m'' <- addFrame m'
+              m'' <- addNode m'
               return $ Pure $ Node3 l pk0 pv0 m'' qk0 qv0 r
             Carry l' ck cv r' -> do
-              bl <- addFrame $ Node2 l pk0 pv0 l'
-              br <- addFrame $ Node2 r' qk0 qv0 r
+              bl <- addNode $ Node2 l pk0 pv0 l'
+              br <- addNode $ Node2 r' qk0 qv0 r
               return $ Pure $ Node2 bl ck cv br
         EQ -> do
           v <- u qv0
@@ -353,34 +353,34 @@ insertF k u (Node3 l pk0 pv0 m qk0 qv0 r) = do
           fr <- fetchStage r
           insertF k u fr >>= \case
             Pure r' -> do
-              r'' <- addFrame r'
+              r'' <- addNode r'
               return $ Pure $ Node3 l pk0 pv0 m qk0 qv0 r''
             Carry l' ck cv r' -> do
-              bl <- addFrame $ Node2 l pk0 pv0 m
-              br <- addFrame $ Node2 l' ck cv r'
+              bl <- addNode $ Node2 l pk0 pv0 m
+              br <- addNode $ Node2 l' ck cv r'
               return $ Pure $ Node2 bl qk0 qv0 br
 insertF _ _ (Tree _ _ _ _) = fail "Unexpected Tree"
 insertF _ _ (Leaf _ _) = fail "Unexpected Leaf"
 
-data Result a = Pure (Frame Encoding a)
+data Result a = Pure (Node Encoding a)
   | Carry !a !KeyPointer !(Spine a) !a
 
 insertSpine :: Encoding -> RawPointer -> Spine StagePointer -> Transaction (Spine StagePointer)
 insertSpine tag p ((m, x) : (n, y) : ss) | m == n = do
-  t <- addFrame $ Tree tag p x y
+  t <- addNode $ Tree tag p x y
   return $ (2 * m + 1, t) : ss
 insertSpine tag p ss = do
-  t <- addFrame $ Leaf tag p
+  t <- addNode $ Leaf tag p
   return $ (1, t) : ss
 
 --------------------------------------------------------------------------------
 -- Fetching
 
 class Fetchable a where
-  fetchFrame :: LisztHandle -> a -> IO (Frame Tag a)
+  fetchNode :: LisztHandle -> a -> IO (Node Tag a)
 
 instance Fetchable RawPointer where
-  fetchFrame h (RP ofs len) = fetchFrame'
+  fetchNode h (RP ofs len) = fetchNode'
     (hSeek (hPayload h) AbsoluteSeek (fromIntegral ofs)) h len
 
 fetchKey :: LisztHandle -> KeyPointer -> IO Key
@@ -394,8 +394,8 @@ fetchKey LisztHandle{..} (KeyPointer (RP ofs len)) = do
       modifyIORef' keyCache (IM.insert ofs key)
       return key
 
-fetchFrame' :: IO () -> LisztHandle -> Int -> IO (Frame Tag RawPointer)
-fetchFrame' seek h len = modifyMVar (refBuffer h) $ \(blen, buf) -> do
+fetchNode' :: IO () -> LisztHandle -> Int -> IO (Node Tag RawPointer)
+fetchNode' seek h len = modifyMVar (refBuffer h) $ \(blen, buf) -> do
   seek
   (blen', buf') <- if blen < len
     then do
@@ -404,12 +404,12 @@ fetchFrame' seek h len = modifyMVar (refBuffer h) $ \(blen, buf) -> do
     else return (blen, buf)
   f <- withForeignPtr buf' $ \ptr -> do
     _ <- hGetBuf (hPayload h) ptr len
-    let f = decodeFrame $ B.PS buf' 0 len
+    let f = decodeNode $ B.PS buf' 0 len
     forceSpine f
   return ((blen', buf'), f)
-{-# INLINE fetchFrame' #-}
+{-# INLINE fetchNode' #-}
 
-lookupSpine :: Fetchable a => LisztHandle -> Key -> Frame tag a -> IO (Maybe (Spine a))
+lookupSpine :: Fetchable a => LisztHandle -> Key -> Node tag a -> IO (Maybe (Spine a))
 lookupSpine h k (Leaf1 p v) = do
   vp <- fetchKey h p
   if k == vp then return (Just v) else return Nothing
@@ -421,37 +421,37 @@ lookupSpine h k (Leaf2 p u q v) = do
 lookupSpine h k (Node2 l p v r) = do
   vp <- fetchKey h p
   case compare k vp of
-    LT -> fetchFrame h l >>= lookupSpine h k
+    LT -> fetchNode h l >>= lookupSpine h k
     EQ -> return (Just v)
-    GT -> fetchFrame h r >>= lookupSpine h k
+    GT -> fetchNode h r >>= lookupSpine h k
 lookupSpine h k (Node3 l p u m q v r) = do
   vp <- fetchKey h p
   case compare k vp of
-    LT -> fetchFrame h l >>= lookupSpine h k
+    LT -> fetchNode h l >>= lookupSpine h k
     EQ -> return (Just u)
     GT -> do
       vq <- fetchKey h q
       case compare k vq of
-        LT -> fetchFrame h m >>= lookupSpine h k
+        LT -> fetchNode h m >>= lookupSpine h k
         EQ -> return (Just v)
-        GT -> fetchFrame h r >>= lookupSpine h k
+        GT -> fetchNode h r >>= lookupSpine h k
 lookupSpine _ _ _ = return Nothing
 
-availableKeys :: LisztHandle -> Frame t RawPointer -> IO [Key]
+availableKeys :: LisztHandle -> Node t RawPointer -> IO [Key]
 availableKeys _ Empty = return []
 availableKeys h (Leaf1 k _) = pure <$> fetchKey h k
 availableKeys h (Leaf2 j _ k _) = sequence [fetchKey h j, fetchKey h k]
 availableKeys h (Node2 l k _ r) = do
-  lks <- fetchFrame h l >>= availableKeys h
+  lks <- fetchNode h l >>= availableKeys h
   vk <- fetchKey h k
-  rks <- fetchFrame h r >>= availableKeys h
+  rks <- fetchNode h r >>= availableKeys h
   return $ lks ++ vk : rks
 availableKeys h (Node3 l j _ m k _ r) = do
-  lks <- fetchFrame h l >>= availableKeys h
+  lks <- fetchNode h l >>= availableKeys h
   vj <- fetchKey h j
-  mks <- fetchFrame h m >>= availableKeys h
+  mks <- fetchNode h m >>= availableKeys h
   vk <- fetchKey h k
-  rks <- fetchFrame h r >>= availableKeys h
+  rks <- fetchNode h r >>= availableKeys h
   return $ lks ++ vj : mks ++ vk : rks
 availableKeys _ _ = fail "availableKeys: unexpected frame"
 
@@ -472,8 +472,8 @@ emptyFooter = B.pack  [0,14,171,160,140,150,185,18,22,70,203,145,129,232,42,76,8
 isFooter :: B.ByteString -> Bool
 isFooter bs = B.drop 128 bs == B.drop 128 emptyFooter
 
-fetchRoot :: LisztHandle -> IO (Frame Tag RawPointer)
-fetchRoot h = fetchFrame'
+fetchRoot :: LisztHandle -> IO (Node Tag RawPointer)
+fetchRoot h = fetchNode'
   (hSeek (hPayload h) SeekFromEnd (-fromIntegral footerSize)) h footerSize
 
 --------------------------------------------------------------------------------
@@ -492,7 +492,7 @@ dropSpine h n0 ((siz0, t0) : xs0)
   | otherwise = dropTree n0 siz0 t0 xs0
   where
     dropTree 0 siz t xs = return $ (siz, t) : xs
-    dropTree n siz t xs = fetchFrame h t >>= \case
+    dropTree n siz t xs = fetchNode h t >>= \case
       Tree _ _ l r
         | n == 1 -> return $ (siz', l) : (siz', r) : xs
         | n <= siz' -> dropTree (n - 1) siz' l ((siz', r) : xs)
@@ -511,7 +511,7 @@ takeSpine h n ((siz, t) : xs) ps
 
 takeTree :: Fetchable a => LisztHandle -> Int -> Int -> a -> [QueryResult] -> IO [QueryResult]
 takeTree _ n _ _ ps | n <= 0 = return ps
-takeTree h n siz t ps = fetchFrame h t >>= \case
+takeTree h n siz t ps = fetchNode h t >>= \case
   Tree tag p l r
     | n == 1 -> return $ (tag, p) : ps
     | n <= siz' -> takeTree h (n - 1) siz' l ((tag, p) : ps)
@@ -528,7 +528,7 @@ wholeSpine h ((_, s) : ss) r = wholeSpine h ss r >>= takeAll h s
 wholeSpine _ [] r = return r
 
 takeAll :: Fetchable a => LisztHandle -> a -> [QueryResult] -> IO [QueryResult]
-takeAll h t ps = fetchFrame h t >>= \case
+takeAll h t ps = fetchNode h t >>= \case
   Tree tag p l r -> takeAll h l ((tag, p) : ps) >>= takeAll h r
   Leaf tag p -> return ((tag, p) : ps)
   _ -> error $ "takeAll: unexpected frame"
@@ -539,7 +539,7 @@ takeSpineWhile :: Fetchable a
   -> Spine a
   -> [QueryResult] -> IO [QueryResult]
 takeSpineWhile cond h = go where
-  go (t0 : ((siz, t) : xs)) ps = fetchFrame h t >>= \case
+  go (t0 : ((siz, t) : xs)) ps = fetchNode h t >>= \case
     Leaf tag p
       | cond tag -> takeAll h (snd t0) ps >>= go xs . ((tag, p):)
       | otherwise -> inner t0 ps
@@ -553,7 +553,7 @@ takeSpineWhile cond h = go where
   go [t] ps = inner t ps
   go [] ps = return ps
 
-  inner (siz, t) ps = fetchFrame h t >>= \case
+  inner (siz, t) ps = fetchNode h t >>= \case
     Leaf tag p
       | cond tag -> return $ (tag, p) : ps
       | otherwise -> return ps
@@ -570,7 +570,7 @@ dropSpineWhile :: Fetchable a
   -> Spine a
   -> IO (Maybe (Int, QueryResult, Spine a))
 dropSpineWhile cond h = go 0 where
-  go !total (t0@(siz0, _) : ts@((siz, t) : xs)) = fetchFrame h t >>= \case
+  go !total (t0@(siz0, _) : ts@((siz, t) : xs)) = fetchNode h t >>= \case
     Leaf tag _
       | cond tag -> go (total + siz0 + siz) xs
       | otherwise -> dropTree total t0 ts
@@ -583,7 +583,7 @@ dropSpineWhile cond h = go 0 where
   go total (t : ts) = dropTree total t ts
   go _ [] = return Nothing
 
-  dropTree !total (siz, t) ts = fetchFrame h t >>= \case
+  dropTree !total (siz, t) ts = fetchNode h t >>= \case
     Leaf tag p
       | cond tag -> go (total + 1) ts
       | otherwise -> return $ Just (total, (tag, p), ts)
@@ -604,7 +604,7 @@ copyByteString (B.PS fp ofs len) = do
     $ \src -> B.memcpy dst (src `plusPtr` ofs) len
   return (B.PS fp' 0 len)
 
-forceSpine :: NFData a => Frame Tag a -> IO (Frame Tag a)
+forceSpine :: NFData a => Node Tag a -> IO (Node Tag a)
 forceSpine f = case f of
   Empty -> return Empty
   Leaf1 _ s -> rnf s `seq` return f
