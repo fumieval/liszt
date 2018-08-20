@@ -136,7 +136,10 @@ createTracker man filePath = do
         bs@(B.PS fp _ _) <- B.hGet (hPayload streamHandle) footerSize
         if isFooter bs
           then try (withForeignPtr fp peekNode) >>= \case
-            Left LisztDecodingException -> wait >> seekRoot
+            Left LisztDecodingException -> do
+              putStrLn "WARNING: isFooter passed, but it's not valid"
+              wait
+              seekRoot
             Right a -> return a
           else wait >> seekRoot
 
