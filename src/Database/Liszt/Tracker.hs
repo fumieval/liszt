@@ -168,11 +168,10 @@ createTracker man filePath = do
 data LisztReader = LisztReader
   { watchManager :: WatchManager
   , vTrackers :: TVar (HM.HashMap FilePath Tracker)
-  , prefix :: FilePath
   }
 
-withLisztReader :: FilePath -> (LisztReader -> IO ()) -> IO ()
-withLisztReader prefix k = do
+withLisztReader :: (LisztReader -> IO ()) -> IO ()
+withLisztReader k = do
   vTrackers <- newTVarIO HM.empty
   withManager $ \watchManager -> k LisztReader{..}
 

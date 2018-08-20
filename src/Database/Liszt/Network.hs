@@ -1,4 +1,4 @@
-{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE LambdaCase, OverloadedStrings #-}
 module Database.Liszt.Network
   ( startServer
   , Connection
@@ -23,27 +23,30 @@ import qualified Data.ByteString.Lazy as BL
 import qualified Network.Socket.SendFile.Handle as SF
 import qualified Network.Socket.ByteString as SB
 import qualified Network.Socket as S
+import System.FilePath ((</>))
 import System.IO
 import Text.Read (readMaybe)
 
 respond :: Tracker -> S.Socket -> IO ()
 respond tracker conn = do
   msg <- SB.recv conn 4096
-  req <- try (evaluate $ decodeCurrent msg) >>= \case
-    Left e -> throwIO $ WineryError e
-    Right a -> return a
-  unless (B.null msg) $ handleRequest tracker req $ \lh lastSeqNo offsets -> do
-    let count = length offsets
-    _ <- SB.send conn $ encodeResp $ Right count
-    forM_ (zip [lastSeqNo - count + 1..] offsets) $ \(i, (tag, RP pos len)) -> do
-      SB.sendAll conn $ WB.toByteString $ mconcat
-        [ WB.word64 (fromIntegral i)
-        , WB.word64 (fromIntegral $ B.length tag), WB.bytes tag
-        , WB.word64 $ fromIntegral len]
-      SF.sendFile' conn (hPayload lh) (fromIntegral pos) (fromIntegral len)
+  unless (B.null msg) $ do
+    req <- try (evaluate $ decodeCurrent msg) >>= \case
+      Left e -> throwIO $ WineryError e
+      Right a -> return a
+    handleRequest tracker req $ \lh lastSeqNo offsets -> do
+      let count = length offsets
+      _ <- SB.send conn $ encodeResp $ Right count
+      forM_ (zip [lastSeqNo - count + 1..] offsets) $ \(i, (tag, RP pos len)) -> do
+        SB.sendAll conn $ WB.toByteString $ mconcat
+          [ WB.word64 (fromIntegral i)
+          , WB.word64 (fromIntegral $ B.length tag), WB.bytes tag
+          , WB.word64 $ fromIntegral len]
+        SF.sendFile' conn (hPayload lh) (fromIntegral pos) (fromIntegral len)
+    respond tracker conn
 
 startServer :: Int -> FilePath -> IO ()
-startServer port prefix = withLisztReader prefix $ \env -> do
+startServer port prefix = withLisztReader $ \env -> do
   let hints = S.defaultHints { S.addrFlags = [S.AI_NUMERICHOST, S.AI_NUMERICSERV], S.addrSocketType = S.Stream }
   addr:_ <- S.getAddrInfo (Just hints) (Just "0.0.0.0") (Just $ show port)
   bracket (S.socket (S.addrFamily addr) (S.addrSocketType addr) (S.addrProtocol addr)) S.close $ \sock -> do
@@ -55,9 +58,9 @@ startServer port prefix = withLisztReader prefix $ \env -> do
       (conn, _) <- S.accept sock
       forkFinally (do
         path <- decode .  BL.fromStrict <$> SB.recv conn 4096
-        withTracker env path $ \t -> do
+        withTracker env (prefix </> path) $ \t -> do
           SB.sendAll conn $ B.pack "READY"
-          forever $ respond t conn)
+          respond t conn)
         $ \result -> do
           case result of
             Left ex -> case fromException ex of
@@ -81,8 +84,13 @@ connect host port path = liftIO $ do
   sock <- S.socket (S.addrFamily addr) (S.addrSocketType addr) (S.addrProtocol addr)
   S.connect sock $ S.addrAddress addr
   SB.sendAll sock $ BL.toStrict $ encode path
-  _ <- SB.recv sock 4096
-  Connection <$> newMVar sock
+  resp <- SB.recv sock 4096
+  case resp of
+    "READY" -> Connection <$> newMVar sock
+    e -> case readMaybe (decode $ BL.fromStrict e) of
+      Just (Left e') -> throw (e' :: LisztError)
+      Just (Right ()) -> fail "connect: Unexpected response"
+      Nothing -> fail $ "connect: Unknown error: " ++ show e
 
 disconnect :: MonadIO m => Connection -> m ()
 disconnect (Connection sock) = liftIO $ takeMVar sock >>= S.close

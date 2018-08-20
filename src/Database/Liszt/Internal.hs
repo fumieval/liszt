@@ -53,6 +53,7 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Internal as B
 import qualified Data.IntMap.Strict as IM
 import Data.IORef
+import Data.Monoid
 import Data.Word
 import Data.Winery.Internal.Builder
 import Foreign.ForeignPtr
@@ -113,6 +114,7 @@ decodeWord8 = StateT $ \ptr -> do
   a <- peek ptr
   let !ptr' = ptr `plusPtr` 1
   return (a, ptr')
+{-# INLINE decodeWord8 #-}
 
 decodeVarInt :: Decoder Int
 decodeVarInt = decodeWord8 >>= \case
