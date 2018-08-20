@@ -98,28 +98,38 @@ instance Bifunctor Node where
 
 instance (Serialise t, Serialise a) => Serialise (Node t a)
 
-decodeNode :: B.ByteString -> Node Tag RawPointer
-decodeNode = either (error . show) id $ getDecoder
-  $ schema (Proxy :: Proxy (Node Tag RawPointer))
-
 data LisztHandle = LisztHandle
   { hPayload :: !Handle
   , refBuffer :: MVar (Int, ForeignPtr Word8)
   , keyCache :: IORef (IM.IntMap Key)
   , refModified :: IORef Bool
   , handleLock :: MVar ()
+  , decodeNode :: B.ByteString -> Node Tag RawPointer
   }
 
 openLiszt :: MonadIO m => FilePath -> m LisztHandle
 openLiszt path = liftIO $ do
   exist <- doesFileExist path
   hPayload <- openBinaryFile path ReadWriteMode
-  unless exist $ B.hPutStr hPayload emptyFooter
+  nodeSchema <- if exist
+    then do
+      bs <- B.hGet hPayload 4096
+      case deserialise bs of
+        Left err -> fail $ "openLiszt: " ++ show err
+        Right a -> return a
+    else do
+      let sch = schema (Proxy :: Proxy (Node Tag RawPointer))
+      B.hPutStr hPayload $ serialise sch
+      B.hPutStr hPayload emptyFooter
+      return sch
   buf <- B.mallocByteString 4096
   refBuffer <- newMVar (4096, buf)
   keyCache <- newIORef IM.empty
   handleLock <- newMVar ()
   refModified <- newIORef False
+  decodeNode <- case getDecoder nodeSchema of
+    Right f -> return f
+    Left e -> fail $ "openLiszt: " ++ show e
   return LisztHandle{..}
 
 closeLiszt :: MonadIO m => LisztHandle -> m ()
@@ -404,7 +414,7 @@ fetchNode' seek h len = modifyMVar (refBuffer h) $ \(blen, buf) -> do
     else return (blen, buf)
   f <- withForeignPtr buf' $ \ptr -> do
     _ <- hGetBuf (hPayload h) ptr len
-    let f = decodeNode $ B.PS buf' 0 len
+    let f = decodeNode h $ B.PS buf' 0 len
     forceSpine f
   return ((blen', buf'), f)
 {-# INLINE fetchNode' #-}

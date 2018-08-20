@@ -141,7 +141,7 @@ createTracker man filePath = do
           then do
             let bs = B.PS fptr (max 0 $ prevSize - footerSize) footerSize
             if isFooter bs
-              then try (evaluate $ decodeNode bs) >>= \case
+              then try (evaluate $ decodeNode streamHandle bs) >>= \case
                 Left (_ :: DecodeException) -> do
                   wait
                   seekRoot 0
