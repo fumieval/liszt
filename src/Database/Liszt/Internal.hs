@@ -83,8 +83,8 @@ data Node t a = Empty
   | Leaf2 !KeyPointer !(Spine a) !KeyPointer !(Spine a)
   | Node2 !a !KeyPointer !(Spine a) !a
   | Node3 !a !KeyPointer !(Spine a) !a !KeyPointer !(Spine a) !a
-  | Leaf !t !RawPointer
-  | Tree !t !RawPointer !a !a
+  | Tip !t !RawPointer
+  | Bin !t !RawPointer !a !a
   deriving (Generic, Show, Eq, Functor, Foldable, Traversable)
 
 encodeNode :: Node Encoding RawPointer -> Encoding
@@ -97,8 +97,8 @@ encodeNode (Node2 l (KeyPointer p) s r) = word8 0x12
 encodeNode (Node3 l (KeyPointer p) s m (KeyPointer q) t r) = word8 0x13
   <> encodeRP l <> encodeRP p <> encodeSpine s
   <> encodeRP m <> encodeRP q <> encodeSpine t <> encodeRP r
-encodeNode (Leaf t p) = word8 0x80 <> varInt (getSize t) <> t <> encodeRP p
-encodeNode (Tree t p l r) = word8 0x81 <> varInt (getSize t) <> t
+encodeNode (Tip t p) = word8 0x80 <> varInt (getSize t) <> t <> encodeRP p
+encodeNode (Bin t p l r) = word8 0x81 <> varInt (getSize t) <> t
   <> encodeRP p <> encodeRP l <> encodeRP r
 
 encodeRP :: RawPointer -> Encoding
@@ -143,8 +143,8 @@ peekNode = evalStateT $ decodeWord8 >>= \case
   0x02 -> Leaf2 <$> kp <*> spine <*> kp <*> spine
   0x12 -> Node2 <$> rp <*> kp <*> spine <*> rp
   0x13 -> Node3 <$> rp <*> kp <*> spine <*> rp <*> kp <*> spine <*> rp
-  0x80 -> Leaf <$> bs <*> rp
-  0x81 -> Tree <$> bs <*> rp <*> rp <*> rp
+  0x80 -> Tip <$> bs <*> rp
+  0x81 -> Bin <$> bs <*> rp <*> rp <*> rp
   x -> throwM LisztDecodingException
   where
     kp = fmap KeyPointer rp
@@ -166,8 +166,8 @@ instance Bifunctor Node where
     Leaf2 j s k t -> Leaf2 j (map (fmap g) s) k (map (fmap g) t)
     Node2 l k s r -> Node2 (g l) k (map (fmap g) s) (g r)
     Node3 l j s m k t r -> Node3 (g l) j (map (fmap g) s) (g m) k (map (fmap g) t) (g r)
-    Tree t p l r -> Tree (f t) p (g l) (g r)
-    Leaf t p -> Leaf (f t) p
+    Bin t p l r -> Bin (f t) p (g l) (g r)
+    Tip t p -> Tip (f t) p
 
 data LisztHandle = LisztHandle
   { hPayload :: !Handle
@@ -282,11 +282,11 @@ commit h transaction = liftIO $ modifyMVar (handleLock h) $ const $ do
           qv' <- traverse (traverse substP) qv
           r' <- substP r
           write (Node3 l' pk pv' m' qk qv' r')
-        substF (Tree t p l r) = do
+        substF (Bin t p l r) = do
           l' <- substP l
           r' <- substP r
-          write (Tree t p l' r')
-        substF (Leaf t p) = write (Leaf t p)
+          write (Bin t p l' r')
+        substF (Tip t p) = write (Tip t p)
 
     writeFooter offset1 $ substF root'
     return ((), a)
@@ -426,18 +426,18 @@ insertF k u (Node3 l pk0 pv0 m qk0 qv0 r) = do
               bl <- addNode $ Node2 l pk0 pv0 m
               br <- addNode $ Node2 l' ck cv r'
               return $ Pure $ Node2 bl qk0 qv0 br
-insertF _ _ (Tree _ _ _ _) = fail "Unexpected Tree"
-insertF _ _ (Leaf _ _) = fail "Unexpected Leaf"
+insertF _ _ (Bin _ _ _ _) = fail "Unexpected Tree"
+insertF _ _ (Tip _ _) = fail "Unexpected Leaf"
 
 data Result a = Pure (Node Encoding a)
   | Carry !a !KeyPointer !(Spine a) !a
 
 insertSpine :: Encoding -> RawPointer -> Spine StagePointer -> Transaction (Spine StagePointer)
 insertSpine tag p ((m, x) : (n, y) : ss) | m == n = do
-  t <- addNode $ Tree tag p x y
+  t <- addNode $ Bin tag p x y
   return $ (2 * m + 1, t) : ss
 insertSpine tag p ss = do
-  t <- addNode $ Leaf tag p
+  t <- addNode $ Tip tag p
   return $ (1, t) : ss
 
 --------------------------------------------------------------------------------
@@ -555,15 +555,15 @@ dropSpine _ _ [] = return []
 dropSpine _ 0 s = return s
 dropSpine h n0 ((siz0, t0) : xs0)
   | siz0 <= n0 = dropSpine h (n0 - siz0) xs0
-  | otherwise = dropTree n0 siz0 t0 xs0
+  | otherwise = dropBin n0 siz0 t0 xs0
   where
-    dropTree 0 siz t xs = return $ (siz, t) : xs
-    dropTree n siz t xs = fetchNode h t >>= \case
-      Tree _ _ l r
+    dropBin 0 siz t xs = return $ (siz, t) : xs
+    dropBin n siz t xs = fetchNode h t >>= \case
+      Bin _ _ l r
         | n == 1 -> return $ (siz', l) : (siz', r) : xs
-        | n <= siz' -> dropTree (n - 1) siz' l ((siz', r) : xs)
-        | otherwise -> dropTree (n - siz' - 1) siz' r xs
-      Leaf _ _ -> return xs
+        | n <= siz' -> dropBin (n - 1) siz' l ((siz', r) : xs)
+        | otherwise -> dropBin (n - siz' - 1) siz' r xs
+      Tip _ _ -> return xs
       _ -> error $ "dropTree: unexpected frame"
       where
         siz' = siz `div` 2
@@ -573,18 +573,18 @@ takeSpine _ n _ ps | n <= 0 = return ps
 takeSpine _ _ [] ps = return ps
 takeSpine h n ((siz, t) : xs) ps
   | n >= siz = takeAll h t ps >>= takeSpine h (n - siz) xs
-  | otherwise = takeTree h n siz t ps
+  | otherwise = takeBin h n siz t ps
 
-takeTree :: Fetchable a => LisztHandle -> Int -> Int -> a -> [QueryResult] -> IO [QueryResult]
-takeTree _ n _ _ ps | n <= 0 = return ps
-takeTree h n siz t ps = fetchNode h t >>= \case
-  Tree tag p l r
+takeBin :: Fetchable a => LisztHandle -> Int -> Int -> a -> [QueryResult] -> IO [QueryResult]
+takeBin _ n _ _ ps | n <= 0 = return ps
+takeBin h n siz t ps = fetchNode h t >>= \case
+  Bin tag p l r
     | n == 1 -> return $ (tag, p) : ps
-    | n <= siz' -> takeTree h (n - 1) siz' l ((tag, p) : ps)
+    | n <= siz' -> takeBin h (n - 1) siz' l ((tag, p) : ps)
     | otherwise -> do
       ps' <- takeAll h l ((tag, p) : ps)
-      takeTree h (n - siz' - 1) siz' r ps'
-  Leaf tag p -> return $ (tag, p) : ps
+      takeBin h (n - siz' - 1) siz' r ps'
+  Tip tag p -> return $ (tag, p) : ps
   _ -> error $ "takeTree: unexpected frame"
   where
     siz' = siz `div` 2
@@ -595,8 +595,8 @@ wholeSpine _ [] r = return r
 
 takeAll :: Fetchable a => LisztHandle -> a -> [QueryResult] -> IO [QueryResult]
 takeAll h t ps = fetchNode h t >>= \case
-  Tree tag p l r -> takeAll h l ((tag, p) : ps) >>= takeAll h r
-  Leaf tag p -> return ((tag, p) : ps)
+  Bin tag p l r -> takeAll h l ((tag, p) : ps) >>= takeAll h r
+  Tip tag p -> return ((tag, p) : ps)
   _ -> error $ "takeAll: unexpected frame"
 
 takeSpineWhile :: Fetchable a
@@ -606,10 +606,10 @@ takeSpineWhile :: Fetchable a
   -> [QueryResult] -> IO [QueryResult]
 takeSpineWhile cond h = go where
   go (t0 : ((siz, t) : xs)) ps = fetchNode h t >>= \case
-    Leaf tag p
+    Tip tag p
       | cond tag -> takeAll h (snd t0) ps >>= go xs . ((tag, p):)
       | otherwise -> inner t0 ps
-    Tree tag p l r
+    Bin tag p l r
       | cond tag -> takeAll h (snd t0) ps
         >>= go ((siz', l) : (siz', r) : xs) . ((tag, p):)
       | otherwise -> inner t0 ps
@@ -620,10 +620,10 @@ takeSpineWhile cond h = go where
   go [] ps = return ps
 
   inner (siz, t) ps = fetchNode h t >>= \case
-    Leaf tag p
+    Tip tag p
       | cond tag -> return $ (tag, p) : ps
       | otherwise -> return ps
-    Tree tag p l r
+    Bin tag p l r
       | cond tag -> go [(siz', l), (siz', r)] ((tag, p) : ps)
       | otherwise -> return ps
     _ -> error "takeSpineWhile: unexpected frame"
@@ -637,23 +637,23 @@ dropSpineWhile :: Fetchable a
   -> IO (Maybe (Int, QueryResult, Spine a))
 dropSpineWhile cond h = go 0 where
   go !total (t0@(siz0, _) : ts@((siz, t) : xs)) = fetchNode h t >>= \case
-    Leaf tag _
+    Tip tag _
       | cond tag -> go (total + siz0 + siz) xs
-      | otherwise -> dropTree total t0 ts
-    Tree tag _ l r
+      | otherwise -> dropBin total t0 ts
+    Bin tag _ l r
       | cond tag -> go (total + siz0 + 1) $ (siz', l) : (siz', r) : xs
-      | otherwise -> dropTree total t0 ts
+      | otherwise -> dropBin total t0 ts
     _ -> error "dropSpineWhile: unexpected frame"
     where
       siz' = siz `div` 2
-  go total (t : ts) = dropTree total t ts
+  go total (t : ts) = dropBin total t ts
   go _ [] = return Nothing
 
-  dropTree !total (siz, t) ts = fetchNode h t >>= \case
-    Leaf tag p
+  dropBin !total (siz, t) ts = fetchNode h t >>= \case
+    Tip tag p
       | cond tag -> go (total + 1) ts
       | otherwise -> return $ Just (total, (tag, p), ts)
-    Tree tag p l r
+    Bin tag p l r
       | cond tag -> go (total + 1) $ (siz', l) : (siz', r) : ts
       | otherwise -> return $ Just (total, (tag, p), (siz', l) : (siz', r) : ts)
     _ -> error "dropSpineWhile: unexpected frame"
