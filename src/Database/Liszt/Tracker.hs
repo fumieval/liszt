@@ -126,34 +126,24 @@ createTracker man filePath = do
     _ -> False)
     $ const $ void $ atomically $ writeTVar vUpdated True
 
-  fptr <- B.mallocByteString 4096
-
   let wait = atomically $ do
         b <- readTVar vUpdated
         unless b retry
         writeTVar vUpdated False
 
-  hSeek (hPayload streamHandle) SeekFromEnd (-fromIntegral footerSize)
-  let seekRoot prevSize = join $ withForeignPtr fptr $ \p -> do
-        n <- hGetBuf (hPayload streamHandle) p 4096
-        if n == 0
-          then do
-            let bs = B.PS fptr (max 0 $ prevSize - footerSize) footerSize
-            if isFooter bs
-              then try (peekNode p) >>= \case
-                Left LisztDecodingException -> return $ do
-                  wait
-                  seekRoot 0
-                Right a -> return (return a)
-              else return $ do
-                wait
-                seekRoot 0
-          else return $ seekRoot n
+  let seekRoot = do
+        hSeek (hPayload streamHandle) SeekFromEnd (-fromIntegral footerSize)
+        bs@(B.PS fp _ _) <- B.hGet (hPayload streamHandle) footerSize
+        if isFooter bs
+          then try (withForeignPtr fp peekNode) >>= \case
+            Left LisztDecodingException -> wait >> seekRoot
+            Right a -> return a
+          else wait >> seekRoot
 
   cache <- Cache <$> newTVarIO IM.empty <*> newTVarIO IM.empty
 
   followThread <- forkFinally (forever $ do
-    newRoot <- fmap CachePointer <$> seekRoot 0
+    newRoot <- fmap CachePointer <$> seekRoot
     join $ atomically $ do
       flipCache cache
       writeTVar vRoot newRoot
