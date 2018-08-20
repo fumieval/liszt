@@ -19,8 +19,8 @@ module Database.Liszt.Internal (
   , availableKeys
   -- * Node
   , Node(..)
-  , decodeNode
-  , forceSpine
+  , peekNode
+  , LisztDecodingException(..)
   -- * Fetching
   , Fetchable(..)
   , RawPointer(..)
@@ -48,16 +48,17 @@ import Control.Monad.Catch
 import Control.Monad.IO.Class
 import Control.Monad.Trans.State.Strict
 import Data.Bifunctor
+import Data.Bits
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Internal as B
 import qualified Data.IntMap.Strict as IM
 import Data.IORef
-import Data.Proxy
 import Data.Word
-import Data.Winery
-import qualified Data.Winery.Internal.Builder as WB
+import Data.Winery.Internal.Builder
 import Foreign.ForeignPtr
 import Foreign.Ptr
+import Foreign.Storable (peek)
+import Numeric (showHex)
 import GHC.Generics (Generic)
 import System.Directory
 import System.IO
@@ -70,10 +71,9 @@ type Tag = B.ByteString
 
 type Spine a = [(Int, a)]
 
-newtype KeyPointer = KeyPointer RawPointer deriving (Show, Eq, Serialise, NFData)
+newtype KeyPointer = KeyPointer RawPointer deriving (Show, Eq, NFData)
 
 data RawPointer = RP !Int !Int deriving (Show, Eq, Generic)
-instance Serialise RawPointer
 instance NFData RawPointer where
   rnf r = r `seq` ()
 
@@ -82,9 +82,80 @@ data Node t a = Empty
   | Leaf2 !KeyPointer !(Spine a) !KeyPointer !(Spine a)
   | Node2 !a !KeyPointer !(Spine a) !a
   | Node3 !a !KeyPointer !(Spine a) !a !KeyPointer !(Spine a) !a
-  | Tree !t !RawPointer !a !a
   | Leaf !t !RawPointer
+  | Tree !t !RawPointer !a !a
   deriving (Generic, Show, Eq, Functor, Foldable, Traversable)
+
+encodeNode :: Node Encoding RawPointer -> Encoding
+encodeNode Empty = word8 0x00
+encodeNode (Leaf1 (KeyPointer p) s) = word8 0x01 <> encodeRP p <> encodeSpine s
+encodeNode (Leaf2 (KeyPointer p) s (KeyPointer q) t) = word8 0x02
+  <> encodeRP p <> encodeSpine s <> encodeRP q <> encodeSpine t
+encodeNode (Node2 l (KeyPointer p) s r) = word8 0x12
+  <> encodeRP l <> encodeRP p <> encodeSpine s <> encodeRP r
+encodeNode (Node3 l (KeyPointer p) s m (KeyPointer q) t r) = word8 0x13
+  <> encodeRP l <> encodeRP p <> encodeSpine s
+  <> encodeRP m <> encodeRP q <> encodeSpine t <> encodeRP r
+encodeNode (Leaf t p) = word8 0x80 <> varInt (getSize t) <> t <> encodeRP p
+encodeNode (Tree t p l r) = word8 0x81 <> varInt (getSize t) <> t
+  <> encodeRP p <> encodeRP l <> encodeRP r
+
+encodeRP :: RawPointer -> Encoding
+encodeRP (RP p l) = varInt p <> varInt l
+
+encodeSpine :: Spine RawPointer -> Encoding
+encodeSpine s = varInt (length s) <> foldMap (\(r, p) -> varInt r <> encodeRP p) s
+
+type Decoder = StateT (Ptr Word8) IO
+
+decodeWord8 :: Decoder Word8
+decodeWord8 = StateT $ \ptr -> do
+  a <- peek ptr
+  let !ptr' = ptr `plusPtr` 1
+  return (a, ptr')
+
+decodeVarInt :: Decoder Int
+decodeVarInt = decodeWord8 >>= \case
+  n | testBit n 7 -> do
+      m <- decodeWord8 >>= go
+      if testBit n 6
+        then return $! negate $ unsafeShiftL m 6 .|. fromIntegral n .&. 0x3f
+        else return $! unsafeShiftL m 6 .|. clearBit (fromIntegral n) 7
+    | testBit n 6 -> return $ negate $ fromIntegral $ clearBit n 6
+    | otherwise -> return $ fromIntegral n
+  where
+    go n
+      | testBit n 7 = do
+        m <- decodeWord8 >>= go
+        return $! unsafeShiftL m 7 .|. clearBit (fromIntegral n) 7
+      | otherwise = return $ fromIntegral n
+{-# INLINE decodeVarInt #-}
+
+data LisztDecodingException = LisztDecodingException deriving Show
+instance Exception LisztDecodingException
+
+peekNode :: Ptr Word8 -> IO (Node Tag RawPointer)
+peekNode = evalStateT $ decodeWord8 >>= \case
+  0x00 -> return Empty
+  0x01 -> Leaf1 <$> kp <*> spine
+  0x02 -> Leaf2 <$> kp <*> spine <*> kp <*> spine
+  0x12 -> Node2 <$> rp <*> kp <*> spine <*> rp
+  0x13 -> Node3 <$> rp <*> kp <*> spine <*> rp <*> kp <*> spine <*> rp
+  0x80 -> Leaf <$> bs <*> rp
+  0x81 -> Tree <$> bs <*> rp <*> rp <*> rp
+  x -> throwM LisztDecodingException
+  where
+    kp = fmap KeyPointer rp
+    rp = RP <$> decodeVarInt <*> decodeVarInt
+    spine = do
+      len <- decodeVarInt
+      replicateM len $ (,) <$> decodeVarInt <*> rp
+    bs = do
+      len <- decodeVarInt
+      StateT $ \src -> do
+        fp <- B.mallocByteString len
+        withForeignPtr fp $ \dst -> B.memcpy dst src len
+        return (B.PS fp 0 len, src `plusPtr` len)
 
 instance Bifunctor Node where
   bimap f g = \case
@@ -96,40 +167,24 @@ instance Bifunctor Node where
     Tree t p l r -> Tree (f t) p (g l) (g r)
     Leaf t p -> Leaf (f t) p
 
-instance (Serialise t, Serialise a) => Serialise (Node t a)
-
 data LisztHandle = LisztHandle
   { hPayload :: !Handle
   , refBuffer :: MVar (Int, ForeignPtr Word8)
   , keyCache :: IORef (IM.IntMap Key)
   , refModified :: IORef Bool
   , handleLock :: MVar ()
-  , decodeNode :: B.ByteString -> Node Tag RawPointer
   }
 
 openLiszt :: MonadIO m => FilePath -> m LisztHandle
 openLiszt path = liftIO $ do
   exist <- doesFileExist path
   hPayload <- openBinaryFile path ReadWriteMode
-  nodeSchema <- if exist
-    then do
-      bs <- B.hGet hPayload 4096
-      case deserialise bs of
-        Left err -> fail $ "openLiszt: " ++ show err
-        Right a -> return a
-    else do
-      let sch = schema (Proxy :: Proxy (Node Tag RawPointer))
-      B.hPutStr hPayload $ serialise sch
-      B.hPutStr hPayload emptyFooter
-      return sch
+  unless exist $ B.hPutStr hPayload emptyFooter
   buf <- B.mallocByteString 4096
   refBuffer <- newMVar (4096, buf)
   keyCache <- newIORef IM.empty
   handleLock <- newMVar ()
   refModified <- newIORef False
-  decodeNode <- case getDecoder nodeSchema of
-    Right f -> return f
-    Left e -> fail $ "openLiszt: " ++ show e
   return LisztHandle{..}
 
 closeLiszt :: MonadIO m => LisztHandle -> m ()
@@ -173,8 +228,8 @@ insertRaw key tag payload = do
   ofs <- gets currentPos
   liftIO $ append lh $ \h -> hPutEncoding h payload
   root <- gets currentRoot
-  modify $ \ts -> ts { currentPos = ofs + WB.getSize payload }
-  insertF key (insertSpine tag (ofs `RP` WB.getSize payload)) root >>= \case
+  modify $ \ts -> ts { currentPos = ofs + getSize payload }
+  insertF key (insertSpine tag (ofs `RP` getSize payload)) root >>= \case
     Pure t -> modify $ \ts -> ts { currentRoot = t }
     Carry l k a r -> modify $ \ts -> ts { currentRoot = Node2 l k a r }
 
@@ -199,7 +254,7 @@ commit h transaction = liftIO $ modifyMVar (handleLock h) $ const $ do
   root <- fetchRoot h
   do
     (a, TS _ _ pendings root' offset1) <- runStateT transaction
-      $ TS h 0 IM.empty (bimap WB.bytes Commited root) offset0
+      $ TS h 0 IM.empty (bimap bytes Commited root) offset0
 
     let substP (Commited ofs) = return ofs
         substP (Uncommited i) = case IM.lookup i pendings of
@@ -233,7 +288,7 @@ commit h transaction = liftIO $ modifyMVar (handleLock h) $ const $ do
 
     writeFooter offset1 $ substF root'
     return ((), a)
-    `onException` writeFooter offset0 (write $ first WB.bytes root)
+    `onException` writeFooter offset0 (write $ first bytes root)
   where
     writeFooter ofs m = do
       modified <- readIORef (refModified h)
@@ -248,10 +303,10 @@ commit h transaction = liftIO $ modifyMVar (handleLock h) $ const $ do
     write :: Node Encoding RawPointer -> StateT Int IO RawPointer
     write f = do
       ofs <- get
-      let e = toEncoding f
+      let e = encodeNode f
       liftIO $ hPutEncoding h' e
-      put $! ofs + WB.getSize e
-      return $ RP ofs (WB.getSize e)
+      put $! ofs + getSize e
+      return $ RP ofs (getSize e)
 
 fetchKeyT :: KeyPointer -> Transaction Key
 fetchKeyT p = gets dbHandle >>= \h -> liftIO (fetchKey h p)
@@ -259,7 +314,7 @@ fetchKeyT p = gets dbHandle >>= \h -> liftIO (fetchKey h p)
 fetchStage :: StagePointer -> Transaction (Node Encoding StagePointer)
 fetchStage (Commited p) = do
   h <- gets dbHandle
-  liftIO $ bimap WB.bytes Commited <$> fetchNode h p
+  liftIO $ bimap bytes Commited <$> fetchNode h p
 fetchStage (Uncommited i) = gets pending >>= return . maybe (error "fetch: not found") id . IM.lookup i
 
 insertF :: Key
@@ -414,8 +469,7 @@ fetchNode' seek h len = modifyMVar (refBuffer h) $ \(blen, buf) -> do
     else return (blen, buf)
   f <- withForeignPtr buf' $ \ptr -> do
     _ <- hGetBuf (hPayload h) ptr len
-    let f = decodeNode h $ B.PS buf' 0 len
-    forceSpine f
+    peekNode ptr
   return ((blen', buf'), f)
 {-# INLINE fetchNode' #-}
 
@@ -603,27 +657,3 @@ dropSpineWhile cond h = go 0 where
     _ -> error "dropSpineWhile: unexpected frame"
     where
       siz' = siz `div` 2
-
---------------------------------------------------------------------------------
--- Magical
-
-copyByteString :: B.ByteString -> IO B.ByteString
-copyByteString (B.PS fp ofs len) = do
-  fp' <- B.mallocByteString len
-  withForeignPtr fp' $ \dst -> withForeignPtr fp
-    $ \src -> B.memcpy dst (src `plusPtr` ofs) len
-  return (B.PS fp' 0 len)
-
-forceSpine :: NFData a => Node Tag a -> IO (Node Tag a)
-forceSpine f = case f of
-  Empty -> return Empty
-  Leaf1 _ s -> rnf s `seq` return f
-  Leaf2 _ s _ t -> rnf s `seq` rnf t `seq` return f
-  Node2 _ _ s _ -> rnf s  `seq` return f
-  Node3 _ _ s _ _ t _ -> rnf s `seq` rnf t `seq` return f
-  Tree tag p l r -> do
-    tag' <- copyByteString tag
-    return (Tree tag' p l r)
-  Leaf tag p -> do
-    tag' <- copyByteString tag
-    return (Leaf tag' p)

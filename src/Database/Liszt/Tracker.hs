@@ -32,7 +32,6 @@ import Data.Reflection (Given(..), give)
 import Data.Text (Text)
 import Data.Winery
 import Foreign.ForeignPtr
-import qualified Data.Winery.Internal.Builder as WB
 import GHC.Generics (Generic)
 import System.Directory
 import System.FilePath
@@ -135,21 +134,21 @@ createTracker man filePath = do
         writeTVar vUpdated False
 
   hSeek (hPayload streamHandle) SeekFromEnd (-fromIntegral footerSize)
-  let seekRoot prevSize = do
-        n <- withForeignPtr fptr $ \p -> hGetBuf (hPayload streamHandle) p 4096
+  let seekRoot prevSize = join $ withForeignPtr fptr $ \p -> do
+        n <- hGetBuf (hPayload streamHandle) p 4096
         if n == 0
           then do
             let bs = B.PS fptr (max 0 $ prevSize - footerSize) footerSize
             if isFooter bs
-              then try (evaluate $ decodeNode streamHandle bs) >>= \case
-                Left (_ :: DecodeException) -> do
+              then try (peekNode p) >>= \case
+                Left LisztDecodingException -> return $ do
                   wait
                   seekRoot 0
-                Right a -> forceSpine a
-              else do
+                Right a -> return (return a)
+              else return $ do
                 wait
                 seekRoot 0
-          else seekRoot n
+          else return $ seekRoot n
 
   cache <- Cache <$> newTVarIO IM.empty <*> newTVarIO IM.empty
 
