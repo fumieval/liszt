@@ -97,15 +97,15 @@ encodeNode (Node2 l (KeyPointer p) s r) = word8 0x12
 encodeNode (Node3 l (KeyPointer p) s m (KeyPointer q) t r) = word8 0x13
   <> encodeRP l <> encodeRP p <> encodeSpine s
   <> encodeRP m <> encodeRP q <> encodeSpine t <> encodeRP r
-encodeNode (Tip t p) = word8 0x80 <> varInt (getSize t) <> t <> encodeRP p
-encodeNode (Bin t p l r) = word8 0x81 <> varInt (getSize t) <> t
+encodeNode (Tip t p) = word8 0x80 <> unsignedVarInt (getSize t) <> t <> encodeRP p
+encodeNode (Bin t p l r) = word8 0x81 <> unsignedVarInt (getSize t) <> t
   <> encodeRP p <> encodeRP l <> encodeRP r
 
 encodeRP :: RawPointer -> Encoding
-encodeRP (RP p l) = varInt p <> varInt l
+encodeRP (RP p l) = unsignedVarInt p <> unsignedVarInt l
 
 encodeSpine :: Spine RawPointer -> Encoding
-encodeSpine s = varInt (length s) <> foldMap (\(r, p) -> varInt r <> encodeRP p) s
+encodeSpine s = unsignedVarInt (length s) <> foldMap (\(r, p) -> unsignedVarInt r <> encodeRP p) s
 
 type Decoder = StateT (Ptr Word8) IO
 
@@ -117,14 +117,7 @@ decodeWord8 = StateT $ \ptr -> do
 {-# INLINE decodeWord8 #-}
 
 decodeVarInt :: Decoder Int
-decodeVarInt = decodeWord8 >>= \case
-  n | testBit n 7 -> do
-      m <- decodeWord8 >>= go
-      if testBit n 6
-        then return $! negate $ unsafeShiftL m 6 .|. fromIntegral n .&. 0x3f
-        else return $! unsafeShiftL m 6 .|. clearBit (fromIntegral n) 7
-    | testBit n 6 -> return $ negate $ fromIntegral $ clearBit n 6
-    | otherwise -> return $ fromIntegral n
+decodeVarInt = decodeWord8 >>= go
   where
     go n
       | testBit n 7 = do
