@@ -82,9 +82,29 @@ data Node t a = Empty
   | Leaf2 !KeyPointer !(Spine a) !KeyPointer !(Spine a)
   | Node2 !a !KeyPointer !(Spine a) !a
   | Node3 !a !KeyPointer !(Spine a) !a !KeyPointer !(Spine a) !a
-  | Tree !t !RawPointer !a !a
   | Leaf !t !RawPointer
+  | Tree !t !RawPointer !a !a
   deriving (Generic, Show, Eq, Functor, Foldable, Traversable)
+
+encodeNode :: Node Encoding RawPointer -> Encoding
+encodeNode Empty = WB.word8 0
+encodeNode (Leaf1 (KeyPointer p) s) = WB.word8 1 <> encodeRP p <> encodeSpine s
+encodeNode (Leaf2 (KeyPointer p) s (KeyPointer q) t) = WB.word8 2
+  <> encodeRP p <> encodeSpine s <> encodeRP q <> encodeSpine t
+encodeNode (Node2 l (KeyPointer p) s r) = WB.word8 0x12
+  <> encodeRP l <> encodeRP p <> encodeSpine s <> encodeRP r
+encodeNode (Node3 l (KeyPointer p) s m (KeyPointer q) t r) = WB.word8 0x13
+  <> encodeRP l <> encodeRP p <> encodeSpine s
+  <> encodeRP m <> encodeRP q <> encodeSpine t <> encodeRP r
+encodeNode (Tree t p) = WB.word8 0x80 <> WB.varInt (WB.getSize t) <> t <> encodeRP p
+encodeNode (Tree t p l r) = WB.word8 0x81 <> WB.varInt (WB.getSize t) <> t
+  <> encodeRP p <> encodeRP l <> encodeRP r
+
+encodeRP :: RawPointer -> Encoding
+encodeRP (RawPointer p l) = WB.varInt p <> WB.varInt l
+
+encodeSpine :: Spine RawPointer -> Encoding
+encodeSpine s = WB.varInt (length s) <> foldMap (\(r, p) -> WB.varInt r <> encodeRP p)
 
 instance Bifunctor Node where
   bimap f g = \case

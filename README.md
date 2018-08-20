@@ -29,3 +29,9 @@ from offset 0. `-f "%p\n"` prints payloads with newlines.
 $ liszt foo.liszt message -b 0 -f "%p\n"
 hello, world
 ```
+
+# Representation
+
+A liszt file consists of four types of contents: key, payload, node, and node schema.
+
+Keys and payloads are bytestrings with arbitrary length.
