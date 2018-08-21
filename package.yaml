@@ -21,6 +21,7 @@ description:         Please see the README on GitHub at <https://github.com/fumi
 
 dependencies:
 - base >= 4.7 && < 5
+- cpu
 - deepseq
 - network
 - bytestring
@@ -55,7 +56,7 @@ executables:
     main: server.hs
     source-dirs:         app
     ghc-options:
-    - -threaded
+    - -threaded -O2
     dependencies:
     - liszt
   liszt:

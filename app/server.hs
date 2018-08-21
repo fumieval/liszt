@@ -28,4 +28,3 @@ main = getOpt Permute options <$> getArgs >>= \case
   (_, _, es) -> do
     name <- getProgName
     die $ unlines es ++ usageInfo name options
-

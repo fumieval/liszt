@@ -48,7 +48,6 @@ import Control.Monad.Catch
 import Control.Monad.IO.Class
 import Control.Monad.Trans.State.Strict
 import Data.Bifunctor
-import Data.Bits
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Internal as B
 import qualified Data.IntMap.Strict as IM
@@ -56,10 +55,9 @@ import Data.IORef
 import Data.Monoid
 import Data.Word
 import Data.Winery.Internal.Builder
+import Database.Liszt.Internal.Decoder
 import Foreign.ForeignPtr
 import Foreign.Ptr
-import Foreign.Storable (peek)
-import Numeric (showHex)
 import GHC.Generics (Generic)
 import System.Directory
 import System.IO
@@ -107,30 +105,11 @@ encodeRP (RP p l) = unsignedVarInt p <> unsignedVarInt l
 encodeSpine :: Spine RawPointer -> Encoding
 encodeSpine s = unsignedVarInt (length s) <> foldMap (\(r, p) -> unsignedVarInt r <> encodeRP p) s
 
-type Decoder = StateT (Ptr Word8) IO
-
-decodeWord8 :: Decoder Word8
-decodeWord8 = StateT $ \ptr -> do
-  a <- peek ptr
-  let !ptr' = ptr `plusPtr` 1
-  return (a, ptr')
-{-# INLINE decodeWord8 #-}
-
-decodeVarInt :: Decoder Int
-decodeVarInt = decodeWord8 >>= go
-  where
-    go n
-      | testBit n 7 = do
-        m <- decodeWord8 >>= go
-        return $! unsafeShiftL m 7 .|. clearBit (fromIntegral n) 7
-      | otherwise = return $ fromIntegral n
-{-# INLINE decodeVarInt #-}
-
 data LisztDecodingException = LisztDecodingException deriving Show
 instance Exception LisztDecodingException
 
 peekNode :: Ptr Word8 -> IO (Node Tag RawPointer)
-peekNode = evalStateT $ decodeWord8 >>= \case
+peekNode = runDecoder $ decodeWord8 >>= \case
   0x00 -> return Empty
   0x01 -> Leaf1 <$> kp <*> spine
   0x02 -> Leaf2 <$> kp <*> spine <*> kp <*> spine
@@ -138,7 +117,7 @@ peekNode = evalStateT $ decodeWord8 >>= \case
   0x13 -> Node3 <$> rp <*> kp <*> spine <*> rp <*> kp <*> spine <*> rp
   0x80 -> Tip <$> bs <*> rp
   0x81 -> Bin <$> bs <*> rp <*> rp <*> rp
-  x -> throwM LisztDecodingException
+  _ -> throwM LisztDecodingException
   where
     kp = fmap KeyPointer rp
     rp = RP <$> decodeVarInt <*> decodeVarInt
@@ -147,10 +126,10 @@ peekNode = evalStateT $ decodeWord8 >>= \case
       replicateM len $ (,) <$> decodeVarInt <*> rp
     bs = do
       len <- decodeVarInt
-      StateT $ \src -> do
+      Decoder $ \src -> do
         fp <- B.mallocByteString len
         withForeignPtr fp $ \dst -> B.memcpy dst src len
-        return (B.PS fp 0 len, src `plusPtr` len)
+        return $ DecodeResult (src `plusPtr` len) (B.PS fp 0 len)
 
 instance Bifunctor Node where
   bimap f g = \case
