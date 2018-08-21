@@ -39,6 +39,8 @@ dependencies:
 - reflection
 - text
 - scientific
+- vector
+- vector-th-unbox
 
 library:
   source-dirs: src
@@ -61,3 +63,12 @@ executables:
     source-dirs: app
     dependencies:
     - liszt
+
+benchmarks:
+  bench:
+    main: bench.hs
+    source-dirs: benchmarks
+    ghc-options: -O2
+    dependencies:
+    - liszt
+    - gauge
