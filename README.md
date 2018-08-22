@@ -41,7 +41,7 @@ A liszt file consists of five types of contents: keys, payloads, tags, nodes, an
 A node is one of the following:
 
 * Empty node: `0x00`
-* 1-leaf: `0x01 (P Node) Spine`
+* 1-leaf: `0x01 (P Key) Spine`
 * 2-leaf: `0x02 (P Key) Spine (P Key) Spine`
 * 2-node: `0x12 (P Node) (P Key) Spine (P Node)`
 * 3-node: `0x13 (P Node) (P Key) Spine (P Node) (P Key) Spine (P Node)`
