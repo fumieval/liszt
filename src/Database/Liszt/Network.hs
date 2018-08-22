@@ -14,12 +14,11 @@ import Control.Monad.Catch
 import Control.Monad.IO.Class
 import Database.Liszt.Tracker
 import Database.Liszt.Internal (hPayload, RawPointer(..))
-import Data.Binary
-import Data.Binary.Get
+import Data.Serialize
+import Data.Serialize.Get
 import Data.Winery
 import qualified Data.Winery.Internal.Builder as WB
 import qualified Data.ByteString.Char8 as B
-import qualified Data.ByteString.Lazy as BL
 import qualified Network.Socket.SendFile.Handle as SF
 import qualified Network.Socket.ByteString as SB
 import qualified Network.Socket as S
@@ -57,7 +56,10 @@ startServer port prefix = withLisztReader $ \env -> do
     forever $ do
       (conn, _) <- S.accept sock
       forkFinally (do
-        path <- decode .  BL.fromStrict <$> SB.recv conn 4096
+        bs <- SB.recv conn 4096
+        path <- case decode bs of
+          Right a -> return a
+          Left _ -> throwM InvalidRequest
         withTracker env (prefix </> path) $ \t -> do
           SB.sendAll conn $ B.pack "READY"
           respond t conn)
@@ -70,7 +72,7 @@ startServer port prefix = withLisztReader $ \env -> do
           S.close conn
 
 encodeResp :: Either String Int -> B.ByteString
-encodeResp = BL.toStrict . encode
+encodeResp = encode
 
 newtype Connection = Connection (MVar S.Socket)
 
@@ -83,14 +85,14 @@ connect host port path = liftIO $ do
   addr:_ <- S.getAddrInfo (Just hints) (Just host) (Just $ show port)
   sock <- S.socket (S.addrFamily addr) (S.addrSocketType addr) (S.addrProtocol addr)
   S.connect sock $ S.addrAddress addr
-  SB.sendAll sock $ BL.toStrict $ encode path
+  SB.sendAll sock $ encode path
   resp <- SB.recv sock 4096
   case resp of
     "READY" -> Connection <$> newMVar sock
-    e -> case readMaybe (decode $ BL.fromStrict e) of
-      Just (Left e') -> throw (e' :: LisztError)
-      Just (Right ()) -> fail "connect: Unexpected response"
-      Nothing -> fail $ "connect: Unknown error: " ++ show e
+    e -> case readMaybe <$> decode e of
+      Right (Just (Left e')) -> throw (e' :: LisztError)
+      Right (Just (Right ())) -> fail $ "connect: Unexpected response: " ++ show e
+      _ -> fail $ "connect: Unexpected response: " ++ show e
 
 disconnect :: MonadIO m => Connection -> m ()
 disconnect (Connection sock) = liftIO $ takeMVar sock >>= S.close
@@ -98,14 +100,15 @@ disconnect (Connection sock) = liftIO $ takeMVar sock >>= S.close
 fetch :: MonadIO m => Connection -> Request -> m [(Int, B.ByteString, B.ByteString)]
 fetch (Connection msock) req = liftIO $ modifyMVar msock $ \sock -> do
   SB.sendAll sock $ serialiseOnly req
-  go sock $ runGetIncremental $ get >>= \case
+  bs <- SB.recv sock 4096
+  go sock $ flip runGetPartial bs $ get >>= \case
     Left e -> case readMaybe e of
       Just e' -> throw (e' :: LisztError)
       Nothing -> fail $ "Unknown error: " ++ show e
     Right n -> replicateM n ((,,) <$> get <*> get <*> get)
   where
-    go sock (Done _ _ a) = return (sock, a)
+    go sock (Done a _) = return (sock, a)
     go sock (Partial cont) = do
       bs <- SB.recv sock 4096
-      if B.null bs then go sock $ cont Nothing else go sock $ cont $ Just bs
-    go _ (Fail _ _ str) = fail $ show req ++ ": " ++ str
+      if B.null bs then go sock $ cont "" else go sock $ cont bs
+    go _ (Fail str _) = fail $ show req ++ ": " ++ str

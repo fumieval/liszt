@@ -21,6 +21,7 @@ description:         Please see the README on GitHub at <https://github.com/fumi
 
 dependencies:
 - base >= 4.7 && < 5
+- cereal
 - cpu
 - deepseq
 - network
