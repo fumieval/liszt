@@ -19,7 +19,8 @@ module Database.Liszt (
     defRequest,
     Connection,
     withConnection,
-    fetch
+    fetch,
+    LisztError(..)
     ) where
 
 import Control.Monad.Catch
