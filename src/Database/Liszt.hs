@@ -15,7 +15,9 @@ module Database.Liszt (
     commit,
     commitFile,
     -- * Local reader
+    RawPointer,
     fetchRange,
+    fetchPayload,
     -- * Remote reader
     Offset(..),
     Request(..),
