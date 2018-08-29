@@ -26,7 +26,6 @@ module Database.Liszt (
     LisztError(..)
     ) where
 
-import Control.Monad.Catch
 import Control.Monad.IO.Class
 import Database.Liszt.Internal
 import Database.Liszt.Network
@@ -34,8 +33,8 @@ import Database.Liszt.Tracker
 import Data.Winery
 
 -- | Commit a 'Transaction' to a file.
-commitFile :: (MonadIO m, MonadMask m) => FilePath -> Transaction a -> m a
-commitFile path m = withLiszt path $ \h -> commit h m
+commitFile :: (MonadIO m) => FilePath -> Transaction a -> m a
+commitFile path m = liftIO $ withLiszt path $ \h -> commit h m
 
 -- | Insert a value.
 insert :: Serialise a => Key -> a -> Transaction ()
