@@ -49,12 +49,17 @@ insertTagged k t v = insertRaw k (toEncoding t) (toEncoding v)
 {-# INLINE insertTagged #-}
 
 fetchRange :: MonadIO m => LisztHandle -> Key -> Int -> Int -> m [(Int, Tag, RawPointer)]
-fetchRange h key i j = liftIO $ do
+fetchRange h key i_ j_ = liftIO $ do
   root <- fetchRoot h
   lookupSpine h key root >>= \case
     Nothing -> return []
     Just spine -> do
       let len = spineLength spine
-      spine' <- dropSpine h ((-i) `mod` len) spine
-      result <- takeSpine h (mod j len - mod i len + 1) spine' []
-      return [(k, t, rp) | (k, (t, rp)) <- zip [i `mod` len ..] result]
+      let normalise x
+            | x < 0 = len + x
+            | otherwise = x
+      let j = normalise j_
+      let i = normalise i_
+      spine' <- dropSpine h (len - j - 1) spine
+      result <- takeSpine h (j - i + 1) spine' []
+      return [(k, t, rp) | (k, (t, rp)) <- zip [i..] result]
