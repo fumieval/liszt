@@ -56,8 +56,8 @@ fetchRange h key i_ j_ = liftIO $ do
     Just spine -> do
       let len = spineLength spine
       let normalise x
-            | x < 0 = len + x
-            | otherwise = x
+            | x < 0 = min (len - 1) $ max 0 $ len + x
+            | otherwise = min (len - 1) x
       let j = normalise j_
       let i = normalise i_
       spine' <- dropSpine h (len - j - 1) spine
