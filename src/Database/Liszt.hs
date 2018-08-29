@@ -16,6 +16,7 @@ module Database.Liszt (
     commitFile,
     -- * Local reader
     RawPointer,
+    count,
     fetchRange,
     fetchPayload,
     -- * Remote reader
@@ -49,6 +50,12 @@ insert k v = insertRaw k mempty (toEncoding v)
 insertTagged :: (Serialise t, Serialise a) => Key -> t -> a -> Transaction ()
 insertTagged k t v = insertRaw k (toEncoding t) (toEncoding v)
 {-# INLINE insertTagged #-}
+
+-- | The number of entries in the stream
+count :: MonadIO m => LisztHandle -> Key -> m Int
+count h k = liftIO $ do
+  root <- fetchRoot h
+  maybe 0 spineLength <$> lookupSpine h k root
 
 fetchRange :: MonadIO m => LisztHandle -> Key -> Int -> Int -> m [(Int, Tag, RawPointer)]
 fetchRange h key i_ j_ = liftIO $ do
