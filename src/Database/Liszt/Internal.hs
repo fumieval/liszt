@@ -23,10 +23,10 @@ module Database.Liszt.Internal (
   , LisztDecodingException(..)
   -- * Fetching
   , Fetchable(..)
+  , KeyPointer(..)
   , RawPointer(..)
   , fetchPayload
   -- * Footer
-  , fetchRoot
   , footerSize
   , isFooter
   , lookupSpine

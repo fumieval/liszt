@@ -34,6 +34,7 @@ dependencies:
 - transformers
 - binary
 - containers
+- mmap
 - unordered-containers
 - stm
 - stm-delay
@@ -51,6 +52,7 @@ library:
     - Database.Liszt.Tracker
     - Database.Liszt.Internal
     - Database.Liszt.Network
+    - Database.Liszt.Static
 
 executables:
   lisztd:
