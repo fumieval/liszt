@@ -29,7 +29,9 @@ module Database.Liszt.Internal (
   -- * Footer
   , footerSize
   , isFooter
+  -- * Node
   , lookupSpine
+  , traverseNode
   -- * Spine
   , Spine
   , spineLength
@@ -478,6 +480,31 @@ lookupSpine h k (Node3 l p u m q v r) = do
         EQ -> return (Just v)
         GT -> fetchNode h r >>= lookupSpine h k
 lookupSpine _ _ _ = return Nothing
+
+traverseNode :: (MonadIO m, Fetchable a) => a -> (Key -> Spine RawPointer -> m ()) -> Node Tag RawPointer -> m ()
+traverseNode h f = go where
+  go (Leaf1 p v) = do
+    vp <- liftIO $ fetchKey h p
+    f vp v
+  go (Leaf2 p u q v) = do
+    vp <- liftIO $ fetchKey h p
+    f vp u
+    vq <- liftIO $ fetchKey h q
+    f vq v
+  go (Node2 l p v r) = do
+    liftIO (fetchNode h l) >>= go
+    vp <- liftIO $ fetchKey h p
+    f vp v
+    liftIO (fetchNode h r) >>= go
+  go (Node3 l p u m q v r) = do
+    liftIO (fetchNode h l) >>= go
+    vp <- liftIO $ fetchKey h p
+    f vp u
+    liftIO (fetchNode h m) >>= go
+    vq <- liftIO $ fetchKey h q
+    f vq v
+    liftIO (fetchNode h r) >>= go
+  go _ = pure ()
 
 availableKeys :: Fetchable a => a -> Node t RawPointer -> IO [Key]
 availableKeys _ Empty = return []
