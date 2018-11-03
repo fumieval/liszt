@@ -73,7 +73,7 @@ data LisztError = MalformedRequest
 instance Exception LisztError
 
 data Tracker = Tracker
-  { vRoot :: !(TVar (Node Tag CachePointer))
+  { vRoot :: !(TVar (Node Tag RawPointer))
   , vUpdated :: !(TVar Bool)
   , vPending :: !(TVar [STM (IO ())])
   , vReaders :: !(TVar Int)
@@ -84,14 +84,14 @@ data Tracker = Tracker
   }
 
 data Cache = Cache
-  { primaryCache :: TVar (IM.IntMap (Node Tag CachePointer))
-  , secondaryCache :: TVar (IM.IntMap (Node Tag CachePointer))
+  { primaryCache :: TVar (IM.IntMap (Node Tag RawPointer))
+  , secondaryCache :: TVar (IM.IntMap (Node Tag RawPointer))
   }
 
-newtype CachePointer = CachePointer RawPointer
+newtype CachedHandle = CachedHandle LisztHandle
 
-instance Given Cache => Fetchable CachePointer where
-  fetchNode h (CachePointer p@(RP ofs _)) = join $ atomically $ do
+instance Given Cache => Fetchable CachedHandle where
+  fetchNode (CachedHandle h) p@(RP ofs _) = join $ atomically $ do
     let Cache{..} = given
     pcache <- readTVar primaryCache
     case IM.lookup ofs pcache of
@@ -103,9 +103,11 @@ instance Given Cache => Fetchable CachePointer where
             writeTVar primaryCache $! IM.insert ofs x pcache
             return (pure x)
           Nothing -> return $ do
-            x <- fmap CachePointer <$> fetchNode h p
+            x <- fetchNode h p
             atomically $ modifyTVar' primaryCache $ IM.insert ofs x
             return x
+  fetchKey (CachedHandle h) k = fetchKey h k
+  fetchRoot (CachedHandle h) = fetchRoot h
 
 flipCache :: Cache -> STM ()
 flipCache Cache{..} = do
@@ -146,7 +148,7 @@ createTracker man filePath = do
   cache <- Cache <$> newTVarIO IM.empty <*> newTVarIO IM.empty
 
   followThread <- forkFinally (forever $ do
-    newRoot <- fmap CachePointer <$> seekRoot
+    newRoot <- seekRoot
     join $ atomically $ do
       flipCache cache
       writeTVar vRoot newRoot

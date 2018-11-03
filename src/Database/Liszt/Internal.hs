@@ -416,22 +416,26 @@ insertSpine tag p ss = do
 -- Fetching
 
 class Fetchable a where
-  fetchNode :: LisztHandle -> a -> IO (Node Tag a)
+  fetchNode :: a -> RawPointer -> IO (Node Tag RawPointer)
+  fetchKey :: a -> KeyPointer -> IO Key
+  fetchRoot :: a -> IO (Node Tag RawPointer)
 
-instance Fetchable RawPointer where
+instance Fetchable LisztHandle where
   fetchNode h (RP ofs len) = fetchNode'
     (hSeek (hPayload h) AbsoluteSeek (fromIntegral ofs)) h len
 
-fetchKey :: LisztHandle -> KeyPointer -> IO Key
-fetchKey LisztHandle{..} (KeyPointer (RP ofs len)) = do
-  cache <- readIORef keyCache
-  case IM.lookup ofs cache of
-    Just key -> return key
-    Nothing -> do
-      hSeek hPayload AbsoluteSeek (fromIntegral ofs)
-      key <- B.hGet hPayload len
-      modifyIORef' keyCache (IM.insert ofs key)
-      return key
+  fetchKey LisztHandle{..} (KeyPointer (RP ofs len)) = do
+    cache <- readIORef keyCache
+    case IM.lookup ofs cache of
+      Just key -> return key
+      Nothing -> do
+        hSeek hPayload AbsoluteSeek (fromIntegral ofs)
+        key <- B.hGet hPayload len
+        modifyIORef' keyCache (IM.insert ofs key)
+        return key
+
+  fetchRoot h = fetchNode'
+    (hSeek (hPayload h) SeekFromEnd (-fromIntegral footerSize)) h footerSize
 
 fetchNode' :: IO () -> LisztHandle -> Int -> IO (Node Tag RawPointer)
 fetchNode' seek h len = modifyMVar (refBuffer h) $ \(blen, buf) -> do
@@ -447,7 +451,7 @@ fetchNode' seek h len = modifyMVar (refBuffer h) $ \(blen, buf) -> do
   return ((blen', buf'), f)
 {-# INLINE fetchNode' #-}
 
-lookupSpine :: Fetchable a => LisztHandle -> Key -> Node tag a -> IO (Maybe (Spine a))
+lookupSpine :: Fetchable a => a -> Key -> Node tag RawPointer -> IO (Maybe (Spine RawPointer))
 lookupSpine h k (Leaf1 p v) = do
   vp <- fetchKey h p
   if k == vp then return (Just v) else return Nothing
@@ -475,7 +479,7 @@ lookupSpine h k (Node3 l p u m q v r) = do
         GT -> fetchNode h r >>= lookupSpine h k
 lookupSpine _ _ _ = return Nothing
 
-availableKeys :: LisztHandle -> Node t RawPointer -> IO [Key]
+availableKeys :: Fetchable a => a -> Node t RawPointer -> IO [Key]
 availableKeys _ Empty = return []
 availableKeys h (Leaf1 k _) = pure <$> fetchKey h k
 availableKeys h (Leaf2 j _ k _) = sequence [fetchKey h j, fetchKey h k]
@@ -510,10 +514,6 @@ emptyFooter = B.pack  [0,14,171,160,140,150,185,18,22,70,203,145,129,232,42,76,8
 isFooter :: B.ByteString -> Bool
 isFooter bs = B.drop (footerSize - 64) bs == B.drop (footerSize - 64) emptyFooter
 
-fetchRoot :: LisztHandle -> IO (Node Tag RawPointer)
-fetchRoot h = fetchNode'
-  (hSeek (hPayload h) SeekFromEnd (-fromIntegral footerSize)) h footerSize
-
 --------------------------------------------------------------------------------
 -- Spine operations
 
@@ -522,7 +522,7 @@ spineLength = sum . map fst
 
 type QueryResult = (Tag, RawPointer)
 
-dropSpine :: Fetchable a => LisztHandle -> Int -> Spine a -> IO (Spine a)
+dropSpine :: Fetchable a => a -> Int -> Spine RawPointer -> IO (Spine RawPointer)
 dropSpine _ _ [] = return []
 dropSpine _ 0 s = return s
 dropSpine h n0 ((siz0, t0) : xs0)
@@ -540,14 +540,14 @@ dropSpine h n0 ((siz0, t0) : xs0)
       where
         siz' = siz `div` 2
 
-takeSpine :: Fetchable a => LisztHandle -> Int -> Spine a -> [QueryResult] -> IO [QueryResult]
+takeSpine :: Fetchable a => a -> Int -> Spine RawPointer -> [QueryResult] -> IO [QueryResult]
 takeSpine _ n _ ps | n <= 0 = return ps
 takeSpine _ _ [] ps = return ps
 takeSpine h n ((siz, t) : xs) ps
   | n >= siz = takeAll h t ps >>= takeSpine h (n - siz) xs
   | otherwise = takeBin h n siz t ps
 
-takeBin :: Fetchable a => LisztHandle -> Int -> Int -> a -> [QueryResult] -> IO [QueryResult]
+takeBin :: Fetchable a => a -> Int -> Int -> RawPointer -> [QueryResult] -> IO [QueryResult]
 takeBin _ n _ _ ps | n <= 0 = return ps
 takeBin h n siz t ps = fetchNode h t >>= \case
   Bin tag p l r
@@ -561,11 +561,11 @@ takeBin h n siz t ps = fetchNode h t >>= \case
   where
     siz' = siz `div` 2
 
-wholeSpine :: Fetchable a => LisztHandle -> Spine a -> [QueryResult] -> IO [QueryResult]
+wholeSpine :: Fetchable a => a -> Spine RawPointer -> [QueryResult] -> IO [QueryResult]
 wholeSpine h ((_, s) : ss) r = wholeSpine h ss r >>= takeAll h s
 wholeSpine _ [] r = return r
 
-takeAll :: Fetchable a => LisztHandle -> a -> [QueryResult] -> IO [QueryResult]
+takeAll :: Fetchable a => a -> RawPointer -> [QueryResult] -> IO [QueryResult]
 takeAll h t ps = fetchNode h t >>= \case
   Bin tag p l r -> takeAll h l ((tag, p) : ps) >>= takeAll h r
   Tip tag p -> return ((tag, p) : ps)
@@ -573,8 +573,8 @@ takeAll h t ps = fetchNode h t >>= \case
 
 takeSpineWhile :: Fetchable a
   => (Tag -> Bool)
-  -> LisztHandle
-  -> Spine a
+  -> a
+  -> Spine RawPointer
   -> [QueryResult] -> IO [QueryResult]
 takeSpineWhile cond h = go where
   go (t0 : ((siz, t) : xs)) ps = fetchNode h t >>= \case
@@ -604,9 +604,9 @@ takeSpineWhile cond h = go where
 
 dropSpineWhile :: Fetchable a
   => (Tag -> Bool)
-  -> LisztHandle
-  -> Spine a
-  -> IO (Maybe (Int, QueryResult, Spine a))
+  -> a
+  -> Spine RawPointer
+  -> IO (Maybe (Int, QueryResult, Spine RawPointer))
 dropSpineWhile cond h = go 0 where
   go !total (t0@(siz0, _) : ts@((siz, t) : xs)) = fetchNode h t >>= \case
     Tip tag _
