@@ -15,6 +15,7 @@ instance Fetchable StaticLiszt where
   fetchKey (StaticLiszt bs) (KeyPointer (RP pos len)) = return
     $! B.take len $ B.drop pos bs
   fetchRoot s@(StaticLiszt bs) = fetchNode s (RP (B.length bs - footerSize) footerSize)
+  fetchPayload (StaticLiszt bs) (RP pos len) = return $! B.take len $ B.drop pos bs
 
 openStaticLiszt :: FilePath -> IO StaticLiszt
 openStaticLiszt path = StaticLiszt <$> mmapFileByteString path Nothing

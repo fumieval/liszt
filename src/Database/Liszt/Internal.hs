@@ -421,6 +421,7 @@ class Fetchable a where
   fetchNode :: a -> RawPointer -> IO (Node Tag RawPointer)
   fetchKey :: a -> KeyPointer -> IO Key
   fetchRoot :: a -> IO (Node Tag RawPointer)
+  fetchPayload :: a -> RawPointer -> IO B.ByteString
 
 instance Fetchable LisztHandle where
   fetchNode h (RP ofs len) = fetchNode'
@@ -438,6 +439,10 @@ instance Fetchable LisztHandle where
 
   fetchRoot h = fetchNode'
     (hSeek (hPayload h) SeekFromEnd (-fromIntegral footerSize)) h footerSize
+
+  fetchPayload LisztHandle{..} (RP ofs len) = do
+    hSeek hPayload AbsoluteSeek (fromIntegral ofs)
+    B.hGet hPayload len
 
 fetchNode' :: IO () -> LisztHandle -> Int -> IO (Node Tag RawPointer)
 fetchNode' seek h len = modifyMVar (refBuffer h) $ \(blen, buf) -> do
@@ -523,11 +528,6 @@ availableKeys h (Node3 l j _ m k _ r) = do
   rks <- fetchNode h r >>= availableKeys h
   return $ lks ++ vj : mks ++ vk : rks
 availableKeys _ _ = fail "availableKeys: unexpected frame"
-
-fetchPayload :: LisztHandle -> RawPointer -> IO B.ByteString
-fetchPayload LisztHandle{..} (RP ofs len) = do
-  hSeek hPayload AbsoluteSeek (fromIntegral ofs)
-  B.hGet hPayload len
 
 --------------------------------------------------------------------------------
 -- Footer (root node)
