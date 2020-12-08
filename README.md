@@ -62,7 +62,7 @@ Spine prefixed by the length of the list.
 Tree is either
 
 * Tip: `0x80 Int Tag (P Payload)`
-* Bin: `0x81 Int Tag (P Payload) (P Node) (P Node)`
+* Bin: `0x81 Int (P Payload) (P Node) (P Node)`
 
 where the Int represents the length of the `Tag`.
 

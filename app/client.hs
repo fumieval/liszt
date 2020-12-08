@@ -4,7 +4,6 @@ import Database.Liszt
 
 import Control.Monad
 import Data.Function (fix)
-import Data.Winery
 import qualified Data.ByteString.Char8 as B
 import System.Environment
 import System.IO
@@ -55,10 +54,6 @@ parseFormat ('%' : c : str) t@(ofs, tag, payload) = do
     't' -> B.hPutStr stdout tag
     'i' -> print ofs
     's' -> print (B.length payload)
-    'W' -> do
-      let e = toEncoding t
-      print (getSize e)
-      hPutEncoding stdout e
     '%' -> putChar '%'
     _ -> error $ "invalid format specifier: %" ++ c : ""
   parseFormat str t

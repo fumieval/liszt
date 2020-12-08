@@ -22,6 +22,7 @@ import Control.Concurrent.STM
 import Control.Concurrent.STM.Delay
 import Control.Exception
 import Control.Monad
+import Codec.Winery
 import Database.Liszt.Internal
 import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Internal as B
@@ -30,7 +31,6 @@ import qualified Data.HashMap.Strict as HM
 import Data.Scientific (Scientific)
 import Data.Reflection (Given(..), give)
 import Data.Text (Text)
-import Data.Winery
 import Foreign.ForeignPtr
 import GHC.Generics (Generic)
 import System.Directory
@@ -40,10 +40,8 @@ import System.IO
 
 data Offset = SeqNo !Int
   | FromEnd !Int
-  | WineryTag !Schema ![Text] !Scientific
   deriving (Show, Generic)
-instance Serialise Offset
-
+deriving via WineryVariant Offset instance Serialise Offset
 data Request = Request
   { reqKey :: !Key
   , reqTimeout :: !Int
@@ -51,7 +49,7 @@ data Request = Request
   , reqFrom :: !Offset
   , reqTo :: !Offset
   } deriving (Show, Generic)
-instance Serialise Request
+deriving via WineryRecord Request instance Serialise Request
 
 defRequest :: Key -> Request
 defRequest k = Request
@@ -67,13 +65,12 @@ data LisztError = MalformedRequest
   | StreamNotFound
   | FileNotFound
   | IndexNotFound
-  | WinerySchemaError !String
-  | WineryError !DecodeException
-  deriving (Show, Read)
+  | WineryError !WineryException
+  deriving Show
 instance Exception LisztError
 
 data Tracker = Tracker
-  { vRoot :: !(TVar (Node Tag RawPointer))
+  { vRoot :: !(TVar (Node RawPointer))
   , vUpdated :: !(TVar Bool)
   , vPending :: !(TVar [STM (IO ())])
   , vReaders :: !(TVar Int)
@@ -84,8 +81,8 @@ data Tracker = Tracker
   }
 
 data Cache = Cache
-  { primaryCache :: TVar (IM.IntMap (Node Tag RawPointer))
-  , secondaryCache :: TVar (IM.IntMap (Node Tag RawPointer))
+  { primaryCache :: TVar (IM.IntMap (Node RawPointer))
+  , secondaryCache :: TVar (IM.IntMap (Node RawPointer))
   }
 
 newtype CachedHandle = CachedHandle LisztHandle
@@ -108,6 +105,7 @@ instance Given Cache => Fetchable CachedHandle where
             return x
   fetchKey (CachedHandle h) k = fetchKey h k
   fetchRoot (CachedHandle h) = fetchRoot h
+  fetchPayload = error "fetchPayload"
 
 flipCache :: Cache -> STM ()
 flipCache Cache{..} = do
@@ -220,23 +218,6 @@ handleRequest str@Tracker{..} req@Request{..} cont = do
               case reqFrom of
                 FromEnd n -> takeSpine streamHandle (min reqLimit $ ofs - (len - n) + 1) spine' [] >>= cont streamHandle ofs
                 SeqNo n -> takeSpine streamHandle (min reqLimit $ ofs - n + 1) spine' [] >>= cont streamHandle ofs
-                WineryTag sch name p -> do
-                  dec <- handleWinery sch name
-                  takeSpineWhile ((>=p) . dec) streamHandle spine' [] >>= cont streamHandle ofs
       case reqTo of
         FromEnd ofs -> goSeqNo (len - ofs)
         SeqNo ofs -> goSeqNo ofs
-        WineryTag sch name p -> do
-          dec <- handleWinery sch name
-          dropSpineWhile ((>=p) . dec) streamHandle spine >>= \case
-            Nothing -> cont streamHandle 0 []
-            Just (dropped, e, spine') -> case reqFrom of
-              FromEnd n -> takeSpine streamHandle (min reqLimit $ n - dropped + 1) spine' [e] >>= cont streamHandle (len - dropped)
-              SeqNo n -> takeSpine streamHandle (min reqLimit $ len - dropped - n + 1) spine' [e] >>= cont streamHandle (len - dropped)
-              WineryTag sch' name' q -> do
-                dec' <- handleWinery sch' name'
-                takeSpineWhile ((>=q) . dec') streamHandle spine' [e] >>= cont streamHandle (len - dropped)
-  where
-    handleWinery :: Schema -> [Text] -> IO (B.ByteString -> Scientific)
-    handleWinery sch names = either (throwIO . WinerySchemaError . show) pure
-      $ getDecoderBy (foldr (flip extractFieldBy) deserialiser names) sch
