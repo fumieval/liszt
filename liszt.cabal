@@ -1,9 +1,4 @@
--- This file has been generated from package.yaml by hpack version 0.28.2.
---
--- see: https://github.com/sol/hpack
---
--- hash: c1ee15086a149b1c1f994a73cc94b20dd96f160bd3768278d18a333d9103e54f
-
+cabal-version:  2.2
 name:           liszt
 version:        0.2.0.1
 synopsis:       Append only key-list database
@@ -14,10 +9,10 @@ bug-reports:    https://github.com/fumieval/liszt/issues
 author:         Fumiaki Kinoshita
 maintainer:     fumiexcel@gmail.com
 copyright:      Copyright (c) 2018 Fumiaki Kinoshita
-license:        BSD3
+license:        BSD-3-Clause
 license-file:   LICENSE
 build-type:     Simple
-cabal-version:  >= 1.10
+
 extra-source-files:
     ChangeLog.md
     README.md
@@ -26,7 +21,36 @@ source-repository head
   type: git
   location: https://github.com/fumieval/liszt
 
+common deps
+  build-depends:
+      base >=4.7 && <5
+    , binary
+    , bytestring
+    , cereal
+    , containers
+    , cpu
+    , deepseq
+    , directory
+    , exceptions
+    , filepath
+    , fsnotify
+    , mmap
+    , network
+    , reflection
+    , scientific
+    , sendfile
+    , stm
+    , stm-delay
+    , text
+    , transformers
+    , unordered-containers
+    , vector
+    , vector-th-unbox
+    , mason
+    , winery
+
 library
+  import: deps
   exposed-modules:
       Database.Liszt
       Database.Liszt.Tracker
@@ -38,65 +62,19 @@ library
       Paths_liszt
   hs-source-dirs:
       src
-  build-depends:
-      base >=4.7 && <5
-    , binary
-    , bytestring
-    , cereal
-    , containers
-    , cpu
-    , deepseq
-    , directory
-    , exceptions
-    , filepath
-    , fsnotify
-    , mmap
-    , network
-    , reflection
-    , scientific
-    , sendfile
-    , stm
-    , stm-delay
-    , text
-    , transformers
-    , unordered-containers
-    , vector
-    , vector-th-unbox
-    , winery
   default-language: Haskell2010
+  default-extensions:
+    DerivingVia
+    StandaloneDeriving
 
 executable liszt
+  import: deps
   main-is: client.hs
+  build-depends: liszt
   other-modules:
       Paths_liszt
   hs-source-dirs:
       app
-  build-depends:
-      base >=4.7 && <5
-    , binary
-    , bytestring
-    , cereal
-    , containers
-    , cpu
-    , deepseq
-    , directory
-    , exceptions
-    , filepath
-    , fsnotify
-    , liszt
-    , mmap
-    , network
-    , reflection
-    , scientific
-    , sendfile
-    , stm
-    , stm-delay
-    , text
-    , transformers
-    , unordered-containers
-    , vector
-    , vector-th-unbox
-    , winery
   default-language: Haskell2010
 
 executable lisztd
@@ -131,10 +109,10 @@ executable lisztd
     , unordered-containers
     , vector
     , vector-th-unbox
-    , winery
   default-language: Haskell2010
 
 benchmark bench
+  import: deps
   type: exitcode-stdio-1.0
   main-is: bench.hs
   other-modules:
@@ -142,31 +120,4 @@ benchmark bench
   hs-source-dirs:
       benchmarks
   ghc-options: -O2
-  build-depends:
-      base >=4.7 && <5
-    , binary
-    , bytestring
-    , cereal
-    , containers
-    , cpu
-    , deepseq
-    , directory
-    , exceptions
-    , filepath
-    , fsnotify
-    , gauge
-    , liszt
-    , mmap
-    , network
-    , reflection
-    , scientific
-    , sendfile
-    , stm
-    , stm-delay
-    , text
-    , transformers
-    , unordered-containers
-    , vector
-    , vector-th-unbox
-    , winery
   default-language: Haskell2010

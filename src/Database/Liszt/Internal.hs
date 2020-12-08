@@ -25,7 +25,6 @@ module Database.Liszt.Internal (
   , Fetchable(..)
   , KeyPointer(..)
   , RawPointer(..)
-  , fetchPayload
   -- * Footer
   , footerSize
   , isFooter
@@ -56,7 +55,8 @@ import qualified Data.IntMap.Strict as IM
 import Data.IORef
 import Data.Monoid
 import Data.Word
-import Data.Winery.Internal.Builder
+import Mason.Builder (wordVLQ)
+import Mason.Builder.Compat
 import Database.Liszt.Internal.Decoder
 import Foreign.ForeignPtr
 import Foreign.Ptr
@@ -78,16 +78,19 @@ data RawPointer = RP !Int !Int deriving (Show, Eq, Generic)
 instance NFData RawPointer where
   rnf r = r `seq` ()
 
-data Node t a = Empty
+data Node a = Empty
   | Leaf1 !KeyPointer !(Spine a)
   | Leaf2 !KeyPointer !(Spine a) !KeyPointer !(Spine a)
   | Node2 !a !KeyPointer !(Spine a) !a
   | Node3 !a !KeyPointer !(Spine a) !a !KeyPointer !(Spine a) !a
-  | Tip !t !RawPointer
-  | Bin !t !RawPointer !a !a
+  | Tip !Tag !RawPointer
+  | Bin !Tag !RawPointer !a !a
   deriving (Generic, Show, Eq, Functor, Foldable, Traversable)
 
-encodeNode :: Node Encoding RawPointer -> Encoding
+encodeUInt :: Int -> Builder
+encodeUInt = wordVLQ . fromIntegral
+
+encodeNode :: Node RawPointer -> Builder
 encodeNode Empty = word8 0x00
 encodeNode (Leaf1 (KeyPointer p) s) = word8 0x01 <> encodeRP p <> encodeSpine s
 encodeNode (Leaf2 (KeyPointer p) s (KeyPointer q) t) = word8 0x02
@@ -97,20 +100,20 @@ encodeNode (Node2 l (KeyPointer p) s r) = word8 0x12
 encodeNode (Node3 l (KeyPointer p) s m (KeyPointer q) t r) = word8 0x13
   <> encodeRP l <> encodeRP p <> encodeSpine s
   <> encodeRP m <> encodeRP q <> encodeSpine t <> encodeRP r
-encodeNode (Tip t p) = word8 0x80 <> unsignedVarInt (getSize t) <> t <> encodeRP p
-encodeNode (Bin t p l r) = word8 0x81 <> unsignedVarInt (getSize t) <> t
+encodeNode (Tip t p) = word8 0x80 <> encodeUInt (B.length t) <> byteString t <> encodeRP p
+encodeNode (Bin t p l r) = word8 0x81 <> encodeUInt (B.length t) <> byteString t
   <> encodeRP p <> encodeRP l <> encodeRP r
 
-encodeRP :: RawPointer -> Encoding
-encodeRP (RP p l) = unsignedVarInt p <> unsignedVarInt l
+encodeRP :: RawPointer -> Builder
+encodeRP (RP p l) = encodeUInt p <> encodeUInt l
 
-encodeSpine :: Spine RawPointer -> Encoding
-encodeSpine s = unsignedVarInt (length s) <> foldMap (\(r, p) -> unsignedVarInt r <> encodeRP p) s
+encodeSpine :: Spine RawPointer -> Builder
+encodeSpine s = encodeUInt (length s) <> foldMap (\(r, p) -> encodeUInt r <> encodeRP p) s
 
 data LisztDecodingException = LisztDecodingException deriving Show
 instance Exception LisztDecodingException
 
-peekNode :: Ptr Word8 -> IO (Node Tag RawPointer)
+peekNode :: Ptr Word8 -> IO (Node RawPointer)
 peekNode = runDecoder $ decodeWord8 >>= \case
   0x00 -> return Empty
   0x01 -> Leaf1 <$> kp <*> spine
@@ -132,16 +135,6 @@ peekNode = runDecoder $ decodeWord8 >>= \case
         fp <- B.mallocByteString len
         withForeignPtr fp $ \dst -> B.memcpy dst src len
         return $ DecodeResult (src `plusPtr` len) (B.PS fp 0 len)
-
-instance Bifunctor Node where
-  bimap f g = \case
-    Empty -> Empty
-    Leaf1 k s -> Leaf1 k (map (fmap g) s)
-    Leaf2 j s k t -> Leaf2 j (map (fmap g) s) k (map (fmap g) t)
-    Node2 l k s r -> Node2 (g l) k (map (fmap g) s) (g r)
-    Node3 l j s m k t r -> Node3 (g l) j (map (fmap g) s) (g m) k (map (fmap g) t) (g r)
-    Bin t p l r -> Bin (f t) p (g l) (g r)
-    Tip t p -> Tip (f t) p
 
 data LisztHandle = LisztHandle
   { hPayload :: !Handle
@@ -177,8 +170,8 @@ data StagePointer = Commited !RawPointer | Uncommited !Int deriving Eq
 data TransactionState = TS
   { dbHandle :: !LisztHandle
   , freshId :: !Int
-  , pending :: !(IM.IntMap (Node Encoding StagePointer))
-  , currentRoot :: !(Node Encoding StagePointer)
+  , pending :: !(IM.IntMap (Node StagePointer))
+  , currentRoot :: !(Node StagePointer)
   , currentPos :: !Int
   }
 
@@ -198,18 +191,18 @@ append LisztHandle{..} cont = do
   writeIORef refModified True
   cont hPayload
 
-insertRaw :: Key -> Encoding -> Encoding -> Transaction ()
+insertRaw :: Key -> Tag -> Builder -> Transaction ()
 insertRaw key tag payload = do
   lh <- gets dbHandle
   ofs <- gets currentPos
-  liftIO $ append lh $ \h -> hPutEncoding h payload
+  len <- liftIO $ append lh $ \h -> hPutBuilderLen h payload
   root <- gets currentRoot
-  modify $ \ts -> ts { currentPos = ofs + getSize payload }
-  insertF key (insertSpine tag (ofs `RP` getSize payload)) root >>= \case
+  modify $ \ts -> ts { currentPos = ofs + len }
+  insertF key (insertSpine tag (ofs `RP` len)) root >>= \case
     Pure t -> modify $ \ts -> ts { currentRoot = t }
     Carry l k a r -> modify $ \ts -> ts { currentRoot = Node2 l k a r }
 
-addNode :: Node Encoding StagePointer -> Transaction StagePointer
+addNode :: Node StagePointer -> Transaction StagePointer
 addNode f = state $ \ts -> (Uncommited (freshId ts), ts
   { freshId = freshId ts + 1
   , pending = IM.insert (freshId ts) f (pending ts) })
@@ -230,12 +223,14 @@ commit h transaction = liftIO $ modifyMVar (handleLock h) $ const $ do
   root <- fetchRoot h
   do
     (a, TS _ _ pendings root' offset1) <- runStateT transaction
-      $ TS h 0 IM.empty (bimap bytes Commited root) offset0
+      $ TS h 0 IM.empty (fmap Commited root) offset0
 
-    let substP (Commited ofs) = return ofs
+    let substP :: StagePointer -> StateT Int IO RawPointer
+        substP (Commited ofs) = return ofs
         substP (Uncommited i) = case IM.lookup i pendings of
           Just f -> substF f
           Nothing -> error "panic!"
+        substF :: Node StagePointer -> StateT Int IO RawPointer
         substF Empty = return (RP 0 0)
         substF (Leaf1 pk pv) = do
           pv' <- traverse (traverse substP) pv
@@ -264,7 +259,7 @@ commit h transaction = liftIO $ modifyMVar (handleLock h) $ const $ do
 
     writeFooter offset1 $ substF root'
     return ((), a)
-    `onException` writeFooter offset0 (write $ first bytes root)
+    `onException` writeFooter offset0 (write root)
   where
     writeFooter ofs m = do
       modified <- readIORef (refModified h)
@@ -276,26 +271,26 @@ commit h transaction = liftIO $ modifyMVar (handleLock h) $ const $ do
         writeIORef (refModified h) False
 
     h' = hPayload h
-    write :: Node Encoding RawPointer -> StateT Int IO RawPointer
+    write :: Node RawPointer -> StateT Int IO RawPointer
     write f = do
       ofs <- get
       let e = encodeNode f
-      liftIO $ hPutEncoding h' e
-      put $! ofs + getSize e
-      return $ RP ofs (getSize e)
+      len <- liftIO $ hPutBuilderLen h' e
+      put $! ofs + len
+      return $ RP ofs len
 
 fetchKeyT :: KeyPointer -> Transaction Key
 fetchKeyT p = gets dbHandle >>= \h -> liftIO (fetchKey h p)
 
-fetchStage :: StagePointer -> Transaction (Node Encoding StagePointer)
+fetchStage :: StagePointer -> Transaction (Node StagePointer)
 fetchStage (Commited p) = do
   h <- gets dbHandle
-  liftIO $ bimap bytes Commited <$> fetchNode h p
+  liftIO $ fmap Commited <$> fetchNode h p
 fetchStage (Uncommited i) = gets pending >>= return . maybe (error "fetch: not found") id . IM.lookup i
 
 insertF :: Key
   -> (Spine StagePointer -> Transaction (Spine StagePointer))
-  -> Node Encoding StagePointer
+  -> Node StagePointer
   -> Transaction (Result StagePointer)
 insertF k u Empty = Pure <$> (Leaf1 <$> allocKey k <*> u [])
 insertF k u (Leaf1 pk pv) = do
@@ -403,10 +398,10 @@ insertF k u (Node3 l pk0 pv0 m qk0 qv0 r) = do
 insertF _ _ (Bin _ _ _ _) = fail "Unexpected Tree"
 insertF _ _ (Tip _ _) = fail "Unexpected Leaf"
 
-data Result a = Pure (Node Encoding a)
+data Result a = Pure (Node a)
   | Carry !a !KeyPointer !(Spine a) !a
 
-insertSpine :: Encoding -> RawPointer -> Spine StagePointer -> Transaction (Spine StagePointer)
+insertSpine :: Tag -> RawPointer -> Spine StagePointer -> Transaction (Spine StagePointer)
 insertSpine tag p ((m, x) : (n, y) : ss) | m == n = do
   t <- addNode $ Bin tag p x y
   return $ (2 * m + 1, t) : ss
@@ -418,9 +413,9 @@ insertSpine tag p ss = do
 -- Fetching
 
 class Fetchable a where
-  fetchNode :: a -> RawPointer -> IO (Node Tag RawPointer)
+  fetchNode :: a -> RawPointer -> IO (Node RawPointer)
   fetchKey :: a -> KeyPointer -> IO Key
-  fetchRoot :: a -> IO (Node Tag RawPointer)
+  fetchRoot :: a -> IO (Node RawPointer)
   fetchPayload :: a -> RawPointer -> IO B.ByteString
 
 instance Fetchable LisztHandle where
@@ -444,7 +439,7 @@ instance Fetchable LisztHandle where
     hSeek hPayload AbsoluteSeek (fromIntegral ofs)
     B.hGet hPayload len
 
-fetchNode' :: IO () -> LisztHandle -> Int -> IO (Node Tag RawPointer)
+fetchNode' :: IO () -> LisztHandle -> Int -> IO (Node RawPointer)
 fetchNode' seek h len = modifyMVar (refBuffer h) $ \(blen, buf) -> do
   seek
   (blen', buf') <- if blen < len
@@ -458,7 +453,7 @@ fetchNode' seek h len = modifyMVar (refBuffer h) $ \(blen, buf) -> do
   return ((blen', buf'), f)
 {-# INLINE fetchNode' #-}
 
-lookupSpine :: Fetchable a => a -> Key -> Node tag RawPointer -> IO (Maybe (Spine RawPointer))
+lookupSpine :: Fetchable a => a -> Key -> Node RawPointer -> IO (Maybe (Spine RawPointer))
 lookupSpine h k (Leaf1 p v) = do
   vp <- fetchKey h p
   if k == vp then return (Just v) else return Nothing
@@ -486,7 +481,7 @@ lookupSpine h k (Node3 l p u m q v r) = do
         GT -> fetchNode h r >>= lookupSpine h k
 lookupSpine _ _ _ = return Nothing
 
-traverseNode :: (MonadIO m, Fetchable a) => a -> (Key -> Spine RawPointer -> m ()) -> Node Tag RawPointer -> m ()
+traverseNode :: (MonadIO m, Fetchable a) => a -> (Key -> Spine RawPointer -> m ()) -> Node RawPointer -> m ()
 traverseNode h f = go where
   go (Leaf1 p v) = do
     vp <- liftIO $ fetchKey h p
@@ -511,7 +506,7 @@ traverseNode h f = go where
     liftIO (fetchNode h r) >>= go
   go _ = pure ()
 
-availableKeys :: Fetchable a => a -> Node t RawPointer -> IO [Key]
+availableKeys :: Fetchable a => a -> Node RawPointer -> IO [Key]
 availableKeys _ Empty = return []
 availableKeys h (Leaf1 k _) = pure <$> fetchKey h k
 availableKeys h (Leaf2 j _ k _) = sequence [fetchKey h j, fetchKey h k]

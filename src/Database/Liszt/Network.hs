@@ -16,31 +16,31 @@ import Database.Liszt.Tracker
 import Database.Liszt.Internal (hPayload, RawPointer(..))
 import Data.Serialize
 import Data.Serialize.Get
-import Data.Winery
-import qualified Data.Winery.Internal.Builder as WB
 import qualified Data.ByteString.Char8 as B
 import qualified Network.Socket.SendFile.Handle as SF
 import qualified Network.Socket.ByteString as SB
 import qualified Network.Socket as S
+import qualified Mason.Builder as BB
+import Codec.Winery
+import Codec.Winery.Internal
 import System.FilePath ((</>))
 import System.IO
-import Text.Read (readMaybe)
 
 respond :: Tracker -> S.Socket -> IO ()
 respond tracker conn = do
   msg <- SB.recv conn 4096
   unless (B.null msg) $ do
-    req <- try (evaluate $ decodeCurrent msg) >>= \case
+    req <- case deserialise msg of
       Left e -> throwIO $ WineryError e
       Right a -> return a
     handleRequest tracker req $ \lh lastSeqNo offsets -> do
       let count = length offsets
       _ <- SB.send conn $ encodeResp $ Right count
       forM_ (zip [lastSeqNo - count + 1..] offsets) $ \(i, (tag, RP pos len)) -> do
-        SB.sendAll conn $ WB.toByteString $ mconcat
-          [ WB.word64 (fromIntegral i)
-          , WB.word64 (fromIntegral $ B.length tag), WB.bytes tag
-          , WB.word64 $ fromIntegral len]
+        BB.sendBuilder conn $ mconcat
+          [ BB.word64LE (fromIntegral i)
+          , BB.word64LE (fromIntegral $ B.length tag), BB.byteString tag
+          , BB.word64LE $ fromIntegral len]
         SF.sendFile' conn (hPayload lh) (fromIntegral pos) (fromIntegral len)
     respond tracker conn
 
@@ -89,10 +89,7 @@ connect host port path = liftIO $ do
   resp <- SB.recv sock 4096
   case resp of
     "READY" -> Connection <$> newMVar sock
-    e -> case readMaybe <$> decode e of
-      Right (Just (Left e')) -> throw (e' :: LisztError)
-      Right (Just (Right ())) -> fail $ "connect: Unexpected response: " ++ show e
-      _ -> fail $ "connect: Unexpected response: " ++ show e
+    e -> fail $ "connect: Unexpected response: " ++ show e
 
 disconnect :: MonadIO m => Connection -> m ()
 disconnect (Connection sock) = liftIO $ takeMVar sock >>= S.close
@@ -102,9 +99,7 @@ fetch (Connection msock) req = liftIO $ modifyMVar msock $ \sock -> do
   SB.sendAll sock $ serialiseOnly req
   bs <- SB.recv sock 4096
   go sock $ flip runGetPartial bs $ get >>= \case
-    Left e -> case readMaybe e of
-      Just e' -> throw (e' :: LisztError)
-      Nothing -> fail $ "Unknown error: " ++ show e
+    Left e -> fail $ "Unknown error: " ++ e
     Right n -> replicateM n ((,,) <$> get <*> get <*> get)
   where
     go sock (Done a _) = return (sock, a)

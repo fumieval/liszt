@@ -9,9 +9,9 @@ Insertions can be batched up to one commit in order to reduce overheads.
 
 ```haskell
 commitFile :: FilePath -> Transaction a -> IO a
-insert :: Serialise a => Key -> a -> Transaction ()
+insert :: Key -> Builder -> Transaction ()
 
-> commitFile "foo.liszt" $ insert "message" ("hello, world" :: Text)
+> commitFile "foo.liszt" $ insert "message" "hello, world"
 ```
 
 ## Query
@@ -72,7 +72,7 @@ A footer is a root node padded to 256 bytes long, and the padding must end with 
 8df4 c865 fa3d 300a f3f8 9962 e049 e379 489c e4cd 2b52 a630 5584 004c 4953 5a54
 ```
 
-(last 5 bytes is LISZT)
+(the last 5 bytes are "LISZT")
 
 Committing is performed in the following steps. This append-only scheme grants robustness to some extent.
 
