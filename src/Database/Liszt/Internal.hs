@@ -4,7 +4,7 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE RankNTypes #-}
 module Database.Liszt.Internal (
-  Key
+  Key(..)
   , Tag
   , LisztHandle(..)
   , openLiszt
@@ -49,6 +49,7 @@ import Control.Monad
 import Control.Monad.Catch
 import Control.Monad.IO.Class
 import Control.Monad.Trans.State.Strict
+import qualified Data.Aeson as J
 import Data.Bifunctor
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Internal as B
@@ -56,6 +57,9 @@ import qualified Data.IntMap.Strict as IM
 import Data.IORef
 import Data.Monoid
 import Data.Word
+import Data.String
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as T
 import Mason.Builder
 import Database.Liszt.Internal.Decoder
 import Foreign.ForeignPtr
@@ -64,7 +68,19 @@ import GHC.Generics (Generic)
 import System.Directory
 import System.IO
 
-type Key = B.ByteString
+newtype Key = Key { unKey :: B.ByteString } deriving (Eq, Ord)
+
+instance Show Key where
+  show = show . T.decodeUtf8 . unKey
+
+instance IsString Key where
+  fromString = Key . T.encodeUtf8 . T.pack
+
+instance J.FromJSON Key where
+  parseJSON obj = Key . T.encodeUtf8 <$> J.parseJSON obj
+
+instance J.ToJSON Key where
+  toJSON = J.toJSON . T.decodeUtf8 . unKey
 
 -- | Tag is an extra value attached to a payload. This can be used to perform
 -- a binary search.
@@ -201,12 +217,12 @@ insertRaw key tag payload = do
     Carry l k a r -> modify $ \ts -> ts { currentRoot = Node2 l k a r }
 
 allocKey :: Key -> Transaction KeyPointer
-allocKey key = do
+allocKey (Key key) = do
   lh <- gets dbHandle
   ofs <- gets currentPos
   liftIO $ append lh $ \h -> do
     B.hPutStr h key
-    modifyIORef' (keyCache lh) (IM.insert ofs key)
+    modifyIORef' (keyCache lh) (IM.insert ofs (Key key))
   modify $ \ts -> ts { currentPos = ofs + B.length key }
   return $ KeyPointer $ RP ofs (B.length key)
 
@@ -419,7 +435,7 @@ instance Fetchable LisztHandle where
       Just key -> return key
       Nothing -> do
         hSeek hPayload AbsoluteSeek (fromIntegral ofs)
-        key <- B.hGet hPayload len
+        key <- Key <$> B.hGet hPayload len
         modifyIORef' keyCache (IM.insert ofs key)
         return key
 

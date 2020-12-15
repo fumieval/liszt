@@ -1,4 +1,5 @@
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE RecordWildCards #-}
@@ -22,7 +23,8 @@ import Control.Concurrent.STM
 import Control.Concurrent.STM.Delay
 import Control.Exception
 import Control.Monad
-import Codec.Winery
+import Deriving.Aeson
+import Deriving.Aeson.Stock
 import Database.Liszt.Internal
 import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Internal as B
@@ -31,6 +33,7 @@ import qualified Data.HashMap.Strict as HM
 import Data.Scientific (Scientific)
 import Data.Reflection (Given(..), give)
 import Data.Text (Text)
+import qualified Data.Text.Encoding as T
 import Foreign.ForeignPtr
 import GHC.Generics (Generic)
 import System.Directory
@@ -41,7 +44,8 @@ import System.IO
 data Offset = SeqNo !Int
   | FromEnd !Int
   deriving (Show, Generic)
-deriving via WineryVariant Offset instance Serialise Offset
+  deriving (FromJSON, ToJSON) via CustomJSON '[SumObjectWithSingleField] Offset
+
 data Request = Request
   { reqKey :: !Key
   , reqTimeout :: !Int
@@ -49,7 +53,7 @@ data Request = Request
   , reqFrom :: !Offset
   , reqTo :: !Offset
   } deriving (Show, Generic)
-deriving via WineryRecord Request instance Serialise Request
+  deriving (FromJSON, ToJSON) via PrefixedSnake "req" Request
 
 defRequest :: Key -> Request
 defRequest k = Request
@@ -65,7 +69,6 @@ data LisztError = MalformedRequest
   | StreamNotFound
   | FileNotFound
   | IndexNotFound
-  | WineryError !WineryException
   deriving Show
 instance Exception LisztError
 

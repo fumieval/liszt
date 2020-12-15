@@ -47,7 +47,8 @@ common deps
     , vector
     , vector-th-unbox
     , mason
-    , winery
+    , aeson
+    , deriving-aeson
 
 library
   import: deps

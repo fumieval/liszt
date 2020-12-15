@@ -5,6 +5,7 @@ import Database.Liszt
 import Control.Monad
 import Data.Function (fix)
 import qualified Data.ByteString.Char8 as B
+import Data.String
 import System.Environment
 import System.IO
 import System.Console.GetOpt
@@ -74,7 +75,7 @@ main = getOpt Permute options <$> getArgs >>= \case
     let o = foldl (flip id) defaultOptions fs
     let printer = parseFormat $ format o
     parseHostPort (host o) withConnection (B.pack path) $ \conn -> do
-      let name' = B.pack name
+      let name' = fromString name
       let timeout' = floor $ timeout o * 1000000
       let req i j = Request name' timeout' i j
       forM_ (reverse $ ranges o) $ \(i, j) -> do

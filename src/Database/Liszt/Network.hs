@@ -15,15 +15,15 @@ import Control.Monad.IO.Class
 import Debug.Trace
 import Database.Liszt.Tracker
 import Database.Liszt.Internal (hPayload, RawPointer(..))
+import qualified Data.Aeson as J
 import Data.Serialize
 import Data.Serialize.Get as S
 import qualified Data.ByteString.Char8 as B
+import qualified Data.ByteString.Lazy as BL
 import qualified Network.Socket.SendFile.Handle as SF
 import qualified Network.Socket.ByteString as SB
 import qualified Network.Socket as S
 import qualified Mason.Builder as BB
-import Codec.Winery
-import Codec.Winery.Internal
 import System.FilePath ((</>))
 import System.IO
 
@@ -31,8 +31,8 @@ respond :: Tracker -> S.Socket -> IO ()
 respond tracker conn = do
   msg <- SB.recv conn 4096
   unless (B.null msg) $ do
-    req <- case deserialise msg of
-      Left e -> throwIO $ WineryError e
+    req <- case J.eitherDecode $ BL.fromStrict msg of
+      Left _ -> throwIO InvalidRequest
       Right a -> return a
     handleRequest tracker req $ \lh lastSeqNo offsets -> do
       let count = length offsets
@@ -97,7 +97,7 @@ disconnect (Connection sock) = liftIO $ takeMVar sock >>= S.close
 
 fetch :: MonadIO m => Connection -> Request -> m [(Int, B.ByteString, B.ByteString)]
 fetch (Connection msock) req = liftIO $ modifyMVar msock $ \sock -> do
-  SB.sendAll sock $ serialise req
+  BB.sendBuilder sock $ BB.lazyByteString $ J.encode req
   bs <- SB.recv sock 4096
   go sock $ flip runGetPartial bs $ get >>= \case
     Left e -> fail $ "Unknown error: " ++ e
