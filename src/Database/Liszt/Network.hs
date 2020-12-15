@@ -12,10 +12,11 @@ import Control.Exception (evaluate, throw, throwIO)
 import Control.Monad
 import Control.Monad.Catch
 import Control.Monad.IO.Class
+import Debug.Trace
 import Database.Liszt.Tracker
 import Database.Liszt.Internal (hPayload, RawPointer(..))
 import Data.Serialize
-import Data.Serialize.Get
+import Data.Serialize.Get as S
 import qualified Data.ByteString.Char8 as B
 import qualified Network.Socket.SendFile.Handle as SF
 import qualified Network.Socket.ByteString as SB
@@ -96,11 +97,17 @@ disconnect (Connection sock) = liftIO $ takeMVar sock >>= S.close
 
 fetch :: MonadIO m => Connection -> Request -> m [(Int, B.ByteString, B.ByteString)]
 fetch (Connection msock) req = liftIO $ modifyMVar msock $ \sock -> do
-  SB.sendAll sock $ serialiseOnly req
+  SB.sendAll sock $ serialise req
   bs <- SB.recv sock 4096
   go sock $ flip runGetPartial bs $ get >>= \case
     Left e -> fail $ "Unknown error: " ++ e
-    Right n -> replicateM n ((,,) <$> get <*> get <*> get)
+    Right n -> replicateM n $ do
+	i <- getWord64le
+        tagLen <- fromIntegral <$> getWord64le
+        tag <- S.getBytes tagLen
+        payloadLen <- fromIntegral <$> getWord64le
+        payload <- S.getBytes payloadLen
+	pure (fromIntegral i, tag, payload)
   where
     go sock (Done a _) = return (sock, a)
     go sock (Partial cont) = do
