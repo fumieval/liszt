@@ -165,12 +165,10 @@ withLiszt path = bracket (openLiszt path) closeLiszt
 --------------------------------------------------------------------------------
 -- Transaction
 
-data StagePointer = Commited !RawPointer | Uncommited !Int deriving Eq
+data StagePointer = Commited !RawPointer | Uncommited !(Node StagePointer) deriving Eq
 
 data TransactionState = TS
   { dbHandle :: !LisztHandle
-  , freshId :: !Int
-  , pending :: !(IM.IntMap (Node StagePointer))
   , currentRoot :: !(Node StagePointer)
   , currentPos :: !Int
   }
@@ -202,11 +200,6 @@ insertRaw key tag payload = do
     Pure t -> modify $ \ts -> ts { currentRoot = t }
     Carry l k a r -> modify $ \ts -> ts { currentRoot = Node2 l k a r }
 
-addNode :: Node StagePointer -> Transaction StagePointer
-addNode f = state $ \ts -> (Uncommited (freshId ts), ts
-  { freshId = freshId ts + 1
-  , pending = IM.insert (freshId ts) f (pending ts) })
-
 allocKey :: Key -> Transaction KeyPointer
 allocKey key = do
   lh <- gets dbHandle
@@ -222,14 +215,12 @@ commit h transaction = liftIO $ modifyMVar (handleLock h) $ const $ do
   offset0 <- fromIntegral <$> hFileSize h'
   root <- fetchRoot h
   do
-    (a, TS _ _ pendings root' offset1) <- runStateT transaction
-      $ TS h 0 IM.empty (fmap Commited root) offset0
+    (a, TS _ root' offset1) <- runStateT transaction
+      $ TS h (fmap Commited root) offset0
 
     let substP :: StagePointer -> StateT Int IO RawPointer
         substP (Commited ofs) = return ofs
-        substP (Uncommited i) = case IM.lookup i pendings of
-          Just f -> substF f
-          Nothing -> error "panic!"
+        substP (Uncommited f) = substF f
         substF :: Node StagePointer -> StateT Int IO RawPointer
         substF Empty = return (RP 0 0)
         substF (Leaf1 pk pv) = do
@@ -286,7 +277,7 @@ fetchStage :: StagePointer -> Transaction (Node StagePointer)
 fetchStage (Commited p) = do
   h <- gets dbHandle
   liftIO $ fmap Commited <$> fetchNode h p
-fetchStage (Uncommited i) = gets pending >>= return . maybe (error "fetch: not found") id . IM.lookup i
+fetchStage (Uncommited f) = pure f
 
 insertF :: Key
   -> (Spine StagePointer -> Transaction (Spine StagePointer))
@@ -309,8 +300,8 @@ insertF k u (Leaf2 pk pv qk qv) = do
     LT -> do
       v <- u []
       kp <- allocKey k
-      l <- addNode $ Leaf1 kp v
-      r <- addNode $ Leaf1 qk qv
+      let l = Uncommited $ Leaf1 kp v
+      let r = Uncommited $ Leaf1 qk qv
       return $ Carry l pk pv r
     EQ -> do
       v <- u pv
@@ -320,8 +311,8 @@ insertF k u (Leaf2 pk pv qk qv) = do
       case compare k vqk of
         LT -> do
           v <- u []
-          l <- addNode $ Leaf1 pk pv
-          r <- addNode $ Leaf1 qk qv
+          let l = Uncommited $ Leaf1 pk pv
+          let r = Uncommited $ Leaf1 qk qv
           kp <- allocKey k
           return $ Carry l kp v r
         EQ -> do
@@ -330,8 +321,8 @@ insertF k u (Leaf2 pk pv qk qv) = do
         GT -> do
           v <- u []
           kp <- allocKey k
-          l <- addNode $ Leaf1 pk pv
-          r <- addNode $ Leaf1 kp v
+          let l = Uncommited $ Leaf1 pk pv
+          let r = Uncommited $ Leaf1 kp v
           return $ Carry l qk qv r
 insertF k u (Node2 l pk0 pv0 r) = do
   vpk0 <- fetchKeyT pk0
@@ -340,7 +331,7 @@ insertF k u (Node2 l pk0 pv0 r) = do
       fl <- fetchStage l
       insertF k u fl >>= \case
         Pure l' -> do
-          l'' <- addNode l'
+          let l'' = Uncommited $ l'
           return $ Pure $ Node2 l'' pk0 pv0 r
         Carry l' ck cv r' -> return $ Pure $ Node3 l' ck cv r' pk0 pv0 r
     EQ -> do
@@ -350,7 +341,7 @@ insertF k u (Node2 l pk0 pv0 r) = do
       fr <- fetchStage r
       insertF k u fr >>= \case
         Pure r' -> do
-          r'' <- addNode r'
+          let r'' = Uncommited $ r'
           return $ Pure $ Node2 l pk0 pv0 r''
         Carry l' ck cv r' -> return $ Pure $ Node3 l pk0 pv0 l' ck cv r'
 insertF k u (Node3 l pk0 pv0 m qk0 qv0 r) = do
@@ -360,11 +351,11 @@ insertF k u (Node3 l pk0 pv0 m qk0 qv0 r) = do
       fl <- fetchStage l
       insertF k u fl >>= \case
         Pure l' -> do
-          l'' <- addNode l'
+          let l'' = Uncommited $ l'
           return $ Pure $ Node3 l'' pk0 pv0 m qk0 qv0 r
         Carry l' ck cv r' -> do
-          bl <- addNode (Node2 l' ck cv r')
-          br <- addNode (Node2 m qk0 qv0 r)
+          let bl = Uncommited (Node2 l' ck cv r')
+          let br = Uncommited (Node2 m qk0 qv0 r)
           return $ Pure $ Node2 bl pk0 pv0 br
     EQ -> do
       v <- u pv0
@@ -376,11 +367,11 @@ insertF k u (Node3 l pk0 pv0 m qk0 qv0 r) = do
           fm <- fetchStage m
           insertF k u fm >>= \case
             Pure m' -> do
-              m'' <- addNode m'
+              let m'' = Uncommited $ m'
               return $ Pure $ Node3 l pk0 pv0 m'' qk0 qv0 r
             Carry l' ck cv r' -> do
-              bl <- addNode $ Node2 l pk0 pv0 l'
-              br <- addNode $ Node2 r' qk0 qv0 r
+              let bl = Uncommited $ Node2 l pk0 pv0 l'
+              let br = Uncommited $ Node2 r' qk0 qv0 r
               return $ Pure $ Node2 bl ck cv br
         EQ -> do
           v <- u qv0
@@ -389,11 +380,11 @@ insertF k u (Node3 l pk0 pv0 m qk0 qv0 r) = do
           fr <- fetchStage r
           insertF k u fr >>= \case
             Pure r' -> do
-              r'' <- addNode r'
+              let r'' = Uncommited $ r'
               return $ Pure $ Node3 l pk0 pv0 m qk0 qv0 r''
             Carry l' ck cv r' -> do
-              bl <- addNode $ Node2 l pk0 pv0 m
-              br <- addNode $ Node2 l' ck cv r'
+              let bl = Uncommited $ Node2 l pk0 pv0 m
+              let br = Uncommited $ Node2 l' ck cv r'
               return $ Pure $ Node2 bl qk0 qv0 br
 insertF _ _ (Bin _ _ _ _) = fail "Unexpected Tree"
 insertF _ _ (Tip _ _) = fail "Unexpected Leaf"
@@ -403,10 +394,10 @@ data Result a = Pure (Node a)
 
 insertSpine :: Tag -> RawPointer -> Spine StagePointer -> Transaction (Spine StagePointer)
 insertSpine tag p ((m, x) : (n, y) : ss) | m == n = do
-  t <- addNode $ Bin tag p x y
+  let t = Uncommited $ Bin tag p x y
   return $ (2 * m + 1, t) : ss
 insertSpine tag p ss = do
-  t <- addNode $ Tip tag p
+  let t = Uncommited $ Tip tag p
   return $ (1, t) : ss
 
 --------------------------------------------------------------------------------
