@@ -2,6 +2,7 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE RankNTypes #-}
 module Database.Liszt.Internal (
   Key
   , Tag
@@ -55,8 +56,7 @@ import qualified Data.IntMap.Strict as IM
 import Data.IORef
 import Data.Monoid
 import Data.Word
-import Mason.Builder (wordVLQ)
-import Mason.Builder.Compat
+import Mason.Builder
 import Database.Liszt.Internal.Decoder
 import Foreign.ForeignPtr
 import Foreign.Ptr
@@ -189,7 +189,7 @@ append LisztHandle{..} cont = do
   writeIORef refModified True
   cont hPayload
 
-insertRaw :: Key -> Tag -> Builder -> Transaction ()
+insertRaw :: Key -> Tag -> BuilderFor BufferedIOBackend -> Transaction ()
 insertRaw key tag payload = do
   lh <- gets dbHandle
   ofs <- gets currentPos

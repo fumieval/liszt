@@ -32,14 +32,14 @@ import Control.Monad.IO.Class
 import Database.Liszt.Internal
 import Database.Liszt.Network
 import Database.Liszt.Tracker
-import Mason.Builder.Compat (Builder)
+import Mason.Builder (BuilderFor, BufferedIOBackend)
 
 -- | Commit a 'Transaction' to a file.
 commitFile :: (MonadIO m) => FilePath -> Transaction a -> m a
 commitFile path m = liftIO $ withLiszt path $ \h -> commit h m
 
 -- | Insert a value.
-insert :: Key -> Builder -> Transaction ()
+insert :: Key -> BuilderFor BufferedIOBackend -> Transaction ()
 insert k v = insertRaw k mempty v
 {-# INLINE insert #-}
 
